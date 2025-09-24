@@ -1,0 +1,207 @@
+name: Scheduled ML Experiments
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      experiment_config:
+        description: 'Config file for scheduled run'
+        required: false
+        default: 'experiments/configs/config.yaml'
+        type: string
+
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  scheduled-training:
+    runs-on: ubuntu-latest
+    if: github.repository != 'your-username/template-repo'  # Skip for template repos
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: scheduled-${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -e .
+
+    - name: Check for new data
+      id: data_check
+      run: |
+        # This is a placeholder - implement your data freshness check
+        echo "data_updated=true" >> $GITHUB_OUTPUT
+        echo "data_samples=1000" >> $GITHUB_OUTPUT
+
+    - name: Run scheduled experiment
+      if: steps.data_check.outputs.data_updated == 'true'
+      run: |
+        export GIT_PYTHON_REFRESH=quiet
+        export MLFLOW_TRACKING_URI=sqlite:///mlflow_scheduled.db
+
+        # Generate fresh synthetic data for scheduled run
+        python -c "
+        import pandas as pd
+        import numpy as np
+        import os
+        from datetime import datetime, timedelta
+
+        # Create data directories
+        os.makedirs('data/raw', exist_ok=True)
+
+        # Generate data with temporal component
+        np.random.seed(int(datetime.now().timestamp()) % 1000)
+        n_samples = 2000
+
+        # Simulate market conditions changing over time
+        market_trend = np.random.choice([-1, 0, 1])  # bearish, neutral, bullish
+
+        data = {
+            'subreddit': np.random.choice(['Bitcoin', 'ethereum', 'CryptoCurrency', 'btc'], n_samples),
+            'post_score': np.random.poisson(15 if market_trend > 0 else 8, n_samples),
+            'num_comments': np.random.poisson(7 if market_trend != 0 else 4, n_samples),
+            'sentiment_score': np.random.normal(market_trend * 0.3, 1, n_samples),
+            'text_length': np.random.lognormal(5.2, 1, n_samples),
+            'hour_of_day': np.random.randint(0, 24, n_samples),
+            'btc_price_change': np.random.normal(market_trend * 0.02, 0.05, n_samples),
+            'market_volatility': np.random.exponential(0.03 if market_trend != 0 else 0.02, n_samples),
+            'timestamp': datetime.now().isoformat()
+        }
+
+        # Create spillover target with market influence
+        spillover_prob = (
+            0.2 +
+            0.1 * market_trend +
+            0.3 * (np.array(data['post_score']) > np.percentile(data['post_score'], 80)) +
+            0.2 * (np.array(data['num_comments']) > np.percentile(data['num_comments'], 70)) +
+            0.2 * (np.abs(np.array(data['sentiment_score'])) > 1.0)
+        )
+
+        data['spillover_target'] = np.random.binomial(1, np.clip(spillover_prob, 0, 1), n_samples)
+
+        df = pd.DataFrame(data)
+        df.to_csv('data/raw/scheduled_data.csv', index=False)
+
+        print(f'Generated {len(df)} samples for scheduled run')
+        print(f'Market trend: {market_trend} (spillover rate: {df[\"spillover_target\"].mean():.2f})')
+        "
+
+        # Run the experiment pipeline
+        python examples/sample_experiment.py
+
+    - name: Generate performance report
+      if: steps.data_check.outputs.data_updated == 'true'
+      run: |
+        python -c "
+        import mlflow
+        import pandas as pd
+        import json
+        from datetime import datetime, timedelta
+
+        mlflow.set_tracking_uri('sqlite:///mlflow_scheduled.db')
+
+        # Get recent runs (last 7 days)
+        start_time = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
+
+        try:
+            experiment = mlflow.get_experiment_by_name('info_spillover_experiment')
+            if experiment:
+                runs_df = mlflow.search_runs(
+                    experiment.experiment_id,
+                    filter_string=f'attribute.start_time >= {start_time}',
+                    max_results=20
+                )
+
+                if not runs_df.empty:
+                    # Calculate performance trends
+                    latest_accuracy = runs_df.iloc[0].get('metrics.test_accuracy', 0)
+                    avg_accuracy = runs_df['metrics.test_accuracy'].mean()
+
+                    report = {
+                        'timestamp': datetime.now().isoformat(),
+                        'scheduled_run': True,
+                        'data_samples': '${{ steps.data_check.outputs.data_samples }}',
+                        'latest_accuracy': latest_accuracy,
+                        'avg_accuracy_7d': avg_accuracy,
+                        'total_runs_7d': len(runs_df),
+                        'performance_trend': 'improving' if latest_accuracy > avg_accuracy else 'declining',
+                        'github_run': '${{ github.run_number }}'
+                    }
+                else:
+                    report = {'error': 'No runs found', 'timestamp': datetime.now().isoformat()}
+
+            else:
+                report = {'error': 'Experiment not found', 'timestamp': datetime.now().isoformat()}
+
+        except Exception as e:
+            report = {'error': str(e), 'timestamp': datetime.now().isoformat()}
+
+        with open('scheduled_report.json', 'w') as f:
+            json.dump(report, f, indent=2)
+
+        print('Scheduled Report:')
+        print(json.dumps(report, indent=2, default=str))
+        "
+
+    - name: Upload scheduled artifacts
+      if: steps.data_check.outputs.data_updated == 'true'
+      uses: actions/upload-artifact@v3
+      with:
+        name: scheduled-experiment-${{ github.run_number }}
+        path: |
+          mlflow_scheduled.db
+          scheduled_report.json
+          data/raw/scheduled_data.csv
+        retention-days: 14
+
+    - name: Create performance issue
+      if: steps.data_check.outputs.data_updated == 'true'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+
+          try {
+            const report = JSON.parse(fs.readFileSync('scheduled_report.json', 'utf8'));
+
+            if (report.error) {
+              // Create issue for errors
+              github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🚨 Scheduled Experiment Failed - ${new Date().toISOString().split('T')[0]}`,
+                body: `## Scheduled Experiment Error\n\n**Error:** ${report.error}\n\n**Time:** ${report.timestamp}\n\n**Run:** ${{ github.run_number }}`,
+                labels: ['bug', 'scheduled', 'mlflow']
+              });
+            } else if (report.performance_trend === 'declining') {
+              // Create issue for declining performance
+              github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `⚠️ Model Performance Decline Detected - ${new Date().toISOString().split('T')[0]}`,
+                body: `## Performance Alert\n\n**Latest Accuracy:** ${report.latest_accuracy.toFixed(4)}\n**7-day Average:** ${report.avg_accuracy_7d.toFixed(4)}\n**Trend:** ${report.performance_trend}\n\n**Data Samples:** ${report.data_samples}\n**Runs (7d):** ${report.total_runs_7d}\n\n**Action Required:** Review recent changes and data quality.\n\n**Run:** ${{ github.run_number }}`,
+                labels: ['performance', 'scheduled', 'mlflow', 'needs-attention']
+              });
+            }
+          } catch (error) {
+            console.log('Could not process report:', error.message);
+          }
+
+    - name: Skip notification
+      if: steps.data_check.outputs.data_updated != 'true'
+      run: |
+        echo "No new data detected. Skipping scheduled experiment."

@@ -1,0 +1,112 @@
+name: CI - Tests and Code Quality
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PYTHON_VERSION: '3.10'
+  POETRY_VERSION: '1.7.0'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      # MLFlow tracking database (optional for tests)
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mlflow_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -e .
+
+    - name: Set up environment variables
+      run: |
+        echo "MLFLOW_TRACKING_URI=sqlite:///test_mlflow.db" >> $GITHUB_ENV
+        echo "GIT_PYTHON_REFRESH=quiet" >> $GITHUB_ENV
+
+    - name: Run code quality checks
+      run: |
+        # Linting
+        flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Run type checking
+      run: |
+        mypy src/ --ignore-missing-imports --no-strict-optional
+
+    - name: Run tests
+      run: |
+        pytest tests/ -v --cov=src --cov-report=xml --cov-report=html
+      env:
+        MLFLOW_TRACKING_URI: sqlite:///test_mlflow.db
+
+    - name: Test DVC functionality
+      run: |
+        # Initialize DVC for testing
+        dvc init --no-scm --force
+        dvc remote add -d test_remote /tmp/dvc_test
+
+        # Test DVC pipeline (dry run)
+        dvc dag || echo "No pipeline yet - expected"
+
+    - name: Test MLFlow functionality
+      run: |
+        # Test basic MLFlow operations
+        python -c "
+        import mlflow
+        mlflow.set_tracking_uri('sqlite:///test_mlflow.db')
+        with mlflow.start_run():
+            mlflow.log_param('test_param', 'test_value')
+            mlflow.log_metric('test_metric', 0.95)
+        print('MLFlow test completed successfully')
+        "
+
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results
+        path: |
+          htmlcov/
+          coverage.xml
+          test-results.xml

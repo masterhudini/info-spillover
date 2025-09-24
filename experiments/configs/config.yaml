@@ -1,0 +1,87 @@
+# Experiment Configuration
+experiment:
+  name: "info_spillover_baseline"
+  description: "Baseline experiment for information spillover detection"
+  tags:
+    - "baseline"
+    - "random_forest"
+  random_seed: 42
+
+# Data configuration
+data:
+  train_path: "data/processed/train.csv"
+  val_path: "data/processed/val.csv"
+  test_path: "data/processed/test.csv"
+  target_column: "target"
+
+  # Data preprocessing
+  preprocessing:
+    handle_missing: "drop"  # options: drop, mean, median, mode
+    encoding_method: "label"  # options: label, onehot, target
+    scaling: true
+    feature_selection: true
+
+# Model configuration
+model:
+  name: "random_forest"
+  n_estimators: 100
+  max_depth: 10
+  min_samples_split: 5
+  min_samples_leaf: 2
+  max_features: "sqrt"
+  random_state: 42
+  n_jobs: -1
+
+# Training configuration
+training:
+  validation_split: 0.2
+  cross_validation:
+    enabled: false
+    folds: 5
+    stratified: true
+
+  # Early stopping (if applicable)
+  early_stopping:
+    enabled: false
+    patience: 10
+    monitor: "val_accuracy"
+
+# Feature engineering
+features:
+  selection:
+    method: "k_best"  # options: k_best, rfe, from_model
+    k: 50
+
+  scaling:
+    method: "standard"  # options: standard, minmax, robust
+
+  # Custom feature engineering steps
+  engineering:
+    polynomial_features: false
+    interaction_features: false
+    log_transform: false
+
+# Evaluation metrics
+metrics:
+  primary: "accuracy"
+  additional:
+    - "precision"
+    - "recall"
+    - "f1_score"
+    - "roc_auc"
+
+# Output configuration
+output:
+  model_path: "models/saved/model.pkl"
+  metrics_path: "experiments/outputs/metrics.json"
+  plots_path: "experiments/outputs/plots"
+  logs_path: "experiments/logs"
+
+# MLFlow configuration
+mlflow:
+  experiment_name: "info_spillover_experiment"
+  run_name: null  # Auto-generated if null
+  tracking_uri: "file:./mlruns"
+  log_model: true
+  register_model: false
+  model_name: "info_spillover_model"

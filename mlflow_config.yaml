@@ -1,0 +1,23 @@
+# MLFlow Configuration
+tracking_uri: "file:./mlruns"
+default_artifact_root: "./mlruns"
+
+# Experiment settings
+experiments:
+  - name: "info_spillover_experiment"
+    description: "Information spillover experiments"
+    tags:
+      project: "info_spillover"
+      version: "1.0"
+
+# Model registry settings
+model_registry:
+  default_stage: "None"
+  production_stage: "Production"
+  staging_stage: "Staging"
+
+# Artifact settings
+artifacts:
+  plots_dir: "experiments/outputs/plots"
+  models_dir: "models/saved"
+  logs_dir: "experiments/logs"

@@ -1,0 +1,193 @@
+name: MLFlow Model Registry & Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: 'Model name to promote'
+        required: true
+        type: string
+      stage:
+        description: 'Stage to promote to'
+        required: true
+        default: 'Staging'
+        type: choice
+        options:
+        - Staging
+        - Production
+      run_id:
+        description: 'MLFlow run ID (optional)'
+        required: false
+        type: string
+
+env:
+  PYTHON_VERSION: '3.10'
+  MLFLOW_TRACKING_URI: 'sqlite:///mlflow.db'
+
+jobs:
+  promote-model:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install mlflow pandas numpy scikit-learn
+
+    - name: Download MLFlow database (if available)
+      uses: actions/download-artifact@v3
+      with:
+        name: mlflow-database-latest
+        path: .
+      continue-on-error: true
+
+    - name: Promote model to registry
+      run: |
+        export GIT_PYTHON_REFRESH=quiet
+        python -c "
+        import mlflow
+        from mlflow.tracking import MlflowClient
+
+        mlflow.set_tracking_uri('${{ env.MLFLOW_TRACKING_URI }}')
+        client = MlflowClient()
+
+        model_name = '${{ github.event.inputs.model_name }}'
+        target_stage = '${{ github.event.inputs.stage }}'
+        run_id = '${{ github.event.inputs.run_id }}'
+
+        try:
+            if run_id:
+                # Register specific run
+                model_uri = f'runs:/{run_id}/{model_name}'
+                registered_model = mlflow.register_model(
+                    model_uri=model_uri,
+                    name=model_name
+                )
+                model_version = registered_model.version
+            else:
+                # Get latest version
+                latest_version = client.get_latest_versions(
+                    model_name,
+                    stages=['None', 'Staging']
+                )[0]
+                model_version = latest_version.version
+
+            # Transition to target stage
+            client.transition_model_version_stage(
+                name=model_name,
+                version=model_version,
+                stage=target_stage,
+                archive_existing_versions=True
+            )
+
+            print(f'Successfully promoted {model_name} v{model_version} to {target_stage}')
+
+            # Add description
+            client.update_model_version(
+                name=model_name,
+                version=model_version,
+                description=f'Promoted to {target_stage} via GitHub Actions on ${{ github.run_number }}'
+            )
+
+        except Exception as e:
+            print(f'Error promoting model: {e}')
+            exit(1)
+        "
+
+    - name: Run model validation tests
+      if: github.event.inputs.stage == 'Production'
+      run: |
+        export GIT_PYTHON_REFRESH=quiet
+        python -c "
+        import mlflow
+        from mlflow.tracking import MlflowClient
+        import numpy as np
+
+        mlflow.set_tracking_uri('${{ env.MLFLOW_TRACKING_URI }}')
+        client = MlflowClient()
+
+        model_name = '${{ github.event.inputs.model_name }}'
+
+        try:
+            # Load production model
+            model = mlflow.pyfunc.load_model(f'models:/{model_name}/Production')
+
+            # Generate test data (replace with real validation data)
+            test_data = np.random.randn(10, 10)
+
+            # Test prediction
+            predictions = model.predict(test_data)
+            print(f'Model validation successful. Generated {len(predictions)} predictions.')
+
+        except Exception as e:
+            print(f'Model validation failed: {e}')
+            exit(1)
+        "
+
+    - name: Create deployment summary
+      run: |
+        python -c "
+        import json
+        from datetime import datetime
+
+        summary = {
+            'model_name': '${{ github.event.inputs.model_name }}',
+            'target_stage': '${{ github.event.inputs.stage }}',
+            'run_id': '${{ github.event.inputs.run_id }}' or 'latest',
+            'deployment_time': datetime.now().isoformat(),
+            'github_run': '${{ github.run_number }}',
+            'github_sha': '${{ github.sha }}',
+            'workflow_url': 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+        }
+
+        with open('deployment_summary.json', 'w') as f:
+            json.dump(summary, f, indent=2)
+
+        print('Deployment Summary:')
+        print(json.dumps(summary, indent=2))
+        "
+
+    - name: Upload deployment artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: deployment-summary-${{ github.run_number }}
+        path: |
+          deployment_summary.json
+          mlflow.db
+        retention-days: 30
+
+    - name: Notify deployment status
+      if: github.event.inputs.stage == 'Production'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const summary = `
+          ## 🚀 Model Deployment Summary
+
+          **Model:** \`${{ github.event.inputs.model_name }}\`
+          **Stage:** \`${{ github.event.inputs.stage }}\`
+          **Run ID:** \`${{ github.event.inputs.run_id || 'latest' }}\`
+          **Deployment Time:** \`${new Date().toISOString()}\`
+
+          ✅ Model successfully promoted to ${{ github.event.inputs.stage }}
+
+          **Validation:** ${{ github.event.inputs.stage == 'Production' && '✅ Passed' || '⏭️ Skipped (non-production)' }}
+
+          **Workflow:** [View Details](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          `;
+
+          // Create an issue for production deployments
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `Production Deployment: ${{ github.event.inputs.model_name }} - ${{ github.run_number }}`,
+            body: summary,
+            labels: ['deployment', 'production', 'mlflow']
+          });

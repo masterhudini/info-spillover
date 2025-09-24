@@ -1,0 +1,5 @@
+[core]
+    no_scm = True
+    remote = gcs_bucket
+['remote "gcs_bucket"']
+    url = /home/Hudini/gcs
