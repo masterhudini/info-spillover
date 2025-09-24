@@ -1,0 +1,17 @@
+{
+  "data_processing": {
+    "reddit_posts": 150,
+    "price_points": 150,
+    "combined_data_shape": [
+      0,
+      0
+    ],
+    "features": []
+  },
+  "modeling": {},
+  "backtesting": {},
+  "metadata": {
+    "pipeline_version": "final_v1.0",
+    "execution_timestamp": "2025-09-24T19:49:40.510653"
+  }
+}

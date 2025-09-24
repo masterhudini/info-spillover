@@ -2,12 +2,13 @@ stages:
   prepare_data:
     cmd: python src/data/prepare_data.py
     deps:
-    - data/raw/
     - src/data/prepare_data.py
+    - src/data/bigquery_client.py
     outs:
     - data/processed/train.csv
     - data/processed/val.csv
     - data/processed/test.csv
+    - data/processed/feature_info.json
 
   feature_engineering:
     cmd: python src/features/build_features.py

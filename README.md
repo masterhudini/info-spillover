@@ -52,7 +52,50 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-### 2. Project Initialization
+### 2. Google Cloud Setup (Required for BigQuery)
+
+This project uses Google BigQuery for data storage and processing. You need to configure Google Cloud authentication:
+
+#### Option A: Service Account (Recommended for production)
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create or select a project
+3. Go to IAM & Admin → Service Accounts
+4. Create a new service account with BigQuery permissions:
+   - `BigQuery Data Editor`
+   - `BigQuery Job User`
+   - `BigQuery User`
+5. Download the JSON key file
+6. Set environment variable:
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account-key.json"
+```
+
+#### Option B: User Authentication (For development)
+
+```bash
+# Install Google Cloud SDK
+# Visit: https://cloud.google.com/sdk/docs/install
+
+# Authenticate with your Google account
+gcloud auth application-default login
+
+# Set your project
+gcloud config set project YOUR_PROJECT_ID
+```
+
+#### Verify Setup
+
+```bash
+# Test your Google Cloud configuration
+python src/utils/gcp_setup.py
+
+# Or run the verification directly
+python -c "from src.utils.gcp_setup import GCPAuthenticator; GCPAuthenticator.test_bigquery_access()"
+```
+
+### 3. Project Initialization
 
 ```bash
 # Setup project structure and initialize DVC
@@ -63,22 +106,48 @@ cp .env.example .env
 # Edit .env with your specific settings
 ```
 
-### 3. Run Experiments
+### 4. Run Hierarchical Sentiment Analysis
+
+#### Quick Start - Full Pipeline
 
 ```bash
-# Run complete experiment pipeline
-make experiment
+# Run the complete hierarchical analysis pipeline
+python src/main_pipeline.py
+```
 
-# Or run individual steps
-make prepare-data
-make build-features
-make train
-make evaluate
+This will execute:
+1. 📊 Data processing and feature engineering
+2. 🔄 Spillover analysis (Diebold-Yilmaz framework)
+3. 🧠 Hierarchical modeling (LSTM + GNN)
+4. 💼 Economic evaluation and backtesting
+5. 📋 Comprehensive report generation
+
+#### Individual Components
+
+```bash
+# Test data processing only
+python src/data/hierarchical_data_processor.py
+
+# Run spillover analysis
+python src/analysis/diebold_yilmaz_spillover.py
+
+# Test economic evaluation
+python src/evaluation/economic_evaluation.py
 
 # Start MLFlow UI to track experiments
 make mlflow-start
 # Visit http://localhost:5000
 ```
+
+### 5. Configuration
+
+Edit `experiments/configs/hierarchical_config.yaml` to customize:
+
+- **Data settings**: Date ranges, preprocessing options
+- **Model architecture**: LSTM vs Transformer, GNN type
+- **Spillover analysis**: Forecast horizons, VAR parameters
+- **Backtesting**: Transaction costs, risk parameters
+- **Output**: Visualization and reporting options
 
 ## DVC Integration
 

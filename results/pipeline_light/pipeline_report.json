@@ -1,0 +1,17 @@
+{
+  "execution_timestamp": "2025-09-24T19:47:21.575019",
+  "data_summary": {
+    "shape": [
+      0,
+      0
+    ],
+    "columns": [],
+    "date_range": {
+      "start": null,
+      "end": null
+    }
+  },
+  "model_results": {},
+  "backtest_results": {},
+  "pipeline_version": "lightweight_v1.0"
+}

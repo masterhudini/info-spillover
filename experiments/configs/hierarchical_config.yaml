@@ -1,0 +1,206 @@
+# Hierarchical Sentiment Spillover Analysis Configuration
+# Based on academic methodology for cryptocurrency sentiment analysis
+
+# Experiment metadata
+experiment:
+  name: "hierarchical_sentiment_spillover_crypto"
+  description: "Hierarchical sentiment analysis for cryptocurrency market spillover detection"
+  version: "1.0"
+  tags:
+    - "hierarchical-analysis"
+    - "sentiment-spillover"
+    - "cryptocurrency"
+    - "granger-causality"
+    - "diebold-yilmaz"
+
+# Data configuration
+data:
+  start_date: "2021-01-01"
+  end_date: "2023-12-31"
+  # BigQuery settings inherited from bigquery_client.py
+  preprocessing:
+    min_observations_per_subreddit: 100
+    max_missing_ratio: 0.3
+    stationarity_transformation: "first_difference"
+    outlier_removal: true
+    outlier_threshold: 3.0  # Standard deviations
+
+# Feature engineering settings
+feature_engineering:
+  temporal_windows: [1, 6, 24]  # Hours
+  sentiment_features:
+    compound_sentiment: true
+    emotion_categories: true
+    volume_weighted: true
+  network_features:
+    granger_causality: true
+    max_lags: 5
+    significance_level: 0.05
+    minimum_sample_size: 252  # Observations for reliable causality testing
+
+# Spillover analysis configuration (Diebold-Yilmaz)
+spillover:
+  forecast_horizon: 10
+  identification: "cholesky"  # Options: cholesky, recursive, generalized
+  rolling_analysis:
+    enabled: true
+    window_size: 252  # Business days (~1 year)
+    step_size: 21     # Business days (~1 month)
+    minimum_window_size: 100
+  var_model:
+    max_lags: 10
+    information_criterion: "bic"  # Options: aic, bic, fpe, hqic
+
+# Hierarchical modeling configuration
+hierarchical_model:
+  # Level 1: Individual subreddit models
+  subreddit_model_type: "lstm"  # Options: lstm, transformer
+
+  # LSTM configuration
+  hidden_dim: 128
+  num_layers: 2
+  dropout: 0.2
+  attention: true
+
+  # Transformer configuration (alternative)
+  d_model: 128
+  nhead: 8
+  num_encoder_layers: 3
+  dim_feedforward: 512
+  max_seq_len: 1000
+
+  # Level 2: Graph neural network
+  gnn_type: "GAT"  # Options: GAT, GCN, GGNN
+  gnn_hidden_dim: 64
+  gnn_num_layers: 3
+  gnn_output_dim: 4
+  edge_features: 1
+
+  # Training configuration
+  sequence_length: 24      # Hours of lookback
+  prediction_horizon: 1    # Hours to predict ahead
+  batch_size: 32
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  max_epochs: 100
+  early_stopping_patience: 15
+
+  # Data splitting
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+  # Regularization
+  gradient_clip_val: 1.0
+  scheduler: "ReduceLROnPlateau"
+  scheduler_patience: 10
+  scheduler_factor: 0.5
+
+# Economic evaluation and backtesting
+backtesting:
+  initial_capital: 100000
+  transaction_costs: 0.001    # 0.1% per trade
+  slippage: 0.0005           # 0.05% market impact
+  benchmark_symbol: "BTC-USD"
+
+  # Portfolio construction
+  max_position_size: 0.2     # 20% max allocation per asset
+  rebalancing_frequency: "D" # Daily
+  risk_free_rate: 0.02       # 2% annual
+
+  # Signal generation
+  lookback_window: 5         # Days for signal smoothing
+  signal_threshold: 0.1      # Minimum signal strength
+
+  # Risk management
+  max_drawdown_limit: 0.15   # 15% max drawdown before stopping
+  volatility_target: 0.20    # 20% annual volatility target
+  leverage_limit: 1.0        # No leverage
+
+# MLFlow configuration
+mlflow:
+  tracking_uri: "sqlite:///mlflow.db"
+  experiment_name: "hierarchical_sentiment_spillover"
+  artifact_location: "mlruns"
+  log_model_signature: true
+  log_input_examples: true
+  auto_log: false  # Manual logging for better control
+
+# Output configuration
+output_dir: "results/hierarchical_analysis"
+save_intermediate_results: true
+generate_plots: true
+plot_config:
+  figure_size: [15, 10]
+  dpi: 300
+  style: "seaborn-v0_8-darkgrid"
+  color_palette: "husl"
+
+# Computing configuration
+computing:
+  use_gpu: true
+  num_workers: 4
+  precision: 32              # 16 for mixed precision training
+  deterministic: true        # For reproducibility
+  benchmark: true           # For performance optimization
+
+  # Distributed training (if multiple GPUs available)
+  strategy: "auto"          # Options: auto, ddp, ddp2, dp
+
+# Logging configuration
+logging:
+  level: "INFO"             # Options: DEBUG, INFO, WARNING, ERROR
+  log_to_file: true
+  log_file: "pipeline.log"
+  log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# Reproducibility
+random_state: 42
+torch_seed: 42
+numpy_seed: 42
+
+# Model validation and testing
+validation:
+  cross_validation: false    # Time series CV not recommended for spillover analysis
+  walk_forward_analysis: true
+  out_of_sample_periods: 63  # ~3 months for final validation
+
+  # Statistical tests
+  significance_tests:
+    diebold_mariano: true
+    hansen_spa: true
+    white_reality_check: true
+
+  # Performance metrics
+  metrics:
+    - "annual_return"
+    - "sharpe_ratio"
+    - "sortino_ratio"
+    - "calmar_ratio"
+    - "max_drawdown"
+    - "var_95"
+    - "cvar_95"
+    - "hit_rate"
+    - "information_ratio"
+    - "tracking_error"
+    - "alpha"
+    - "beta"
+
+# Advanced features
+advanced:
+  regime_detection: false    # Market regime detection
+  online_learning: false     # Adaptive model updates
+  ensemble_methods: false    # Multiple model combination
+
+  # Robustness analysis
+  sensitivity_analysis: true
+  parameter_stability_tests: true
+  bootstrap_confidence_intervals: true
+  monte_carlo_simulations: 1000
+
+# Alerts and monitoring
+monitoring:
+  performance_alerts: true
+  drawdown_threshold: 0.10   # Alert if drawdown exceeds 10%
+  volatility_threshold: 0.30 # Alert if volatility exceeds 30%
+  correlation_threshold: 0.90 # Alert if strategy correlation with benchmark exceeds 90%
