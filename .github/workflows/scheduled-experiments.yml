@@ -21,7 +21,7 @@ jobs:
     if: github.repository != 'your-username/template-repo'  # Skip for template repos
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Set up Python
       uses: actions/setup-python@v4
