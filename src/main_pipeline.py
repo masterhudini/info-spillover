@@ -135,8 +135,17 @@ class HierarchicalSentimentPipeline:
         logger.info("STEP 1: DATA PROCESSING AND FEATURE ENGINEERING")
         logger.info("=" * 60)
 
-        # Initialize data processor
-        self.data_processor = HierarchicalDataProcessor()
+        # Initialize BigQuery client with config
+        bq_config = self.config.get('data', {}).get('bigquery', {})
+        project_id = bq_config.get('project_id', 'informationspillover')
+        dataset_id = bq_config.get('dataset_id', 'spillover_statistical_test')
+
+        from src.data.bigquery_client import BigQueryClient
+        bq_client = BigQueryClient(project_id=project_id, dataset_id=dataset_id)
+
+        # Initialize data processor with temporal windows from config
+        temporal_windows = self.config.get('feature_engineering', {}).get('temporal_windows', [1, 6, 24])
+        self.data_processor = HierarchicalDataProcessor(bigquery_client=bq_client, temporal_windows=temporal_windows)
 
         # Process data
         processed_data, network, processing_log = self.data_processor.process_full_pipeline(
@@ -162,7 +171,13 @@ class HierarchicalSentimentPipeline:
 
         if network.number_of_nodes() > 0:
             import networkx as nx
-            nx.write_gml(network, data_output_dir / "granger_causality_network.gml")
+            # Convert numerical edge attributes to strings for GML export
+            network_copy = network.copy()
+            for u, v, data in network_copy.edges(data=True):
+                for key, value in data.items():
+                    if isinstance(value, (int, float, np.integer, np.floating)):
+                        network_copy[u][v][key] = str(value)
+            nx.write_gml(network_copy, data_output_dir / "granger_causality_network.gml")
 
         with open(data_output_dir / "processing_log.json", 'w') as f:
             json.dump(processing_log, f, indent=2, default=str)
@@ -186,10 +201,11 @@ class HierarchicalSentimentPipeline:
             identification=self.config['spillover'].get('identification', 'cholesky')
         )
 
-        # Prepare time series data
+        # Prepare time series data (use correct timestamp column)
+        timestamp_col = 'created_utc' if 'created_utc' in processed_data.columns else 'post_created_utc'
         spillover_data = processed_data.pivot_table(
             values='compound_sentiment',
-            index='created_utc',
+            index=timestamp_col,
             columns='subreddit',
             aggfunc='mean'
         ).resample('1H').mean().dropna()
@@ -626,17 +642,21 @@ class HierarchicalSentimentPipeline:
 
         return backtest_results
 
-    def step_5_generate_report(self):
-        """Step 5: Generate comprehensive report"""
+    def step_5_generate_report(self, modeling_results=None):
+        """Step 5: Generate comprehensive report with statistical analysis"""
 
         logger.info("=" * 60)
         logger.info("STEP 5: GENERATING COMPREHENSIVE REPORT")
         logger.info("=" * 60)
 
+        # Generate statistical significance report
+        statistical_report = self._generate_statistical_significance_report(modeling_results)
+
         # Create comprehensive results summary
         report = {
-            'executive_summary': self._create_executive_summary(),
+            'executive_summary': self._create_executive_summary(modeling_results),
             'methodology': self._create_methodology_summary(),
+            'statistical_analysis': statistical_report,
             'results': self.results,
             'conclusions': self._create_conclusions(),
             'recommendations': self._create_recommendations()
@@ -649,19 +669,22 @@ class HierarchicalSentimentPipeline:
         # Create markdown report
         self._create_markdown_report(report)
 
-        logger.info("Comprehensive report generated")
+        # Create detailed statistical report
+        self._create_detailed_statistical_report(statistical_report)
+
+        logger.info("Comprehensive report with statistical analysis generated")
         logger.info(f"Report saved to: {self.output_dir}")
 
-    def _create_executive_summary(self) -> Dict:
-        """Create executive summary"""
+    def _create_executive_summary(self, modeling_results=None) -> Dict:
+        """Create executive summary with hyperparameter analysis"""
 
-        data_stats = self.results['data_processing']
-        spillover_stats = self.results['spillover_analysis']
-        backtest_stats = self.results['backtesting']
+        data_stats = self.results.get('data_processing', {})
+        spillover_stats = self.results.get('spillover_analysis', {})
+        backtest_stats = self.results.get('backtesting', {})
 
-        return {
+        summary = {
             'dataset_overview': {
-                'observations': data_stats.get('data_shape', [0])[0],
+                'observations': data_stats.get('data_shape', [0])[0] if data_stats.get('data_shape') else 0,
                 'features': len(data_stats.get('features', [])),
                 'subreddits': data_stats.get('network_nodes', 0),
                 'time_period': f"{self.config['data']['start_date']} to {self.config['data']['end_date']}"
@@ -673,6 +696,17 @@ class HierarchicalSentimentPipeline:
                 'max_drawdown': backtest_stats.get('performance_metrics', {}).get('max_drawdown', 0)
             }
         }
+
+        # Add hyperparameter analysis if available
+        if modeling_results and isinstance(modeling_results, dict):
+            if 'total_configurations_tested' in modeling_results:
+                summary['hyperparameter_analysis'] = {
+                    'configurations_tested': modeling_results['total_configurations_tested'],
+                    'best_configuration': modeling_results.get('best_configuration', {}).get('name', 'N/A'),
+                    'best_val_loss': modeling_results.get('best_configuration', {}).get('val_loss', float('inf'))
+                }
+
+        return summary
 
     def _create_methodology_summary(self) -> Dict:
         """Create methodology summary"""
@@ -785,11 +819,363 @@ class HierarchicalSentimentPipeline:
 *This report was generated by the Hierarchical Sentiment Spillover Analysis Pipeline v1.0*
 """
 
+    def _generate_statistical_significance_report(self, modeling_results=None) -> Dict:
+        """Generate comprehensive statistical significance analysis"""
+
+        from scipy import stats
+        import numpy as np
+
+        report = {
+            'spillover_tests': {},
+            'model_performance_tests': {},
+            'hyperparameter_significance': {},
+            'economic_significance': {},
+            'interpretation': {}
+        }
+
+        # Spillover analysis statistical tests
+        spillover_data = self.results.get('spillover_analysis', {})
+        if 'spillover_matrix' in spillover_data:
+            spillover_matrix = np.array(spillover_data['spillover_matrix'])
+
+            # Test for overall significance of spillovers
+            if spillover_matrix.size > 0:
+                # Exclude diagonal elements (self-spillovers)
+                off_diag = spillover_matrix[~np.eye(spillover_matrix.shape[0], dtype=bool)]
+
+                # One-sample t-test against zero
+                t_stat, p_value = stats.ttest_1samp(off_diag, 0)
+
+                report['spillover_tests']['overall_spillover'] = {
+                    'test': 'One-sample t-test against zero spillover',
+                    't_statistic': float(t_stat),
+                    'p_value': float(p_value),
+                    'significant': p_value < 0.05,
+                    'interpretation': self._interpret_spillover_test(t_stat, p_value),
+                    'effect_size': float(np.mean(off_diag)),
+                    'confidence_interval': list(stats.t.interval(0.95, len(off_diag)-1,
+                                                               loc=np.mean(off_diag),
+                                                               scale=stats.sem(off_diag)))
+                }
+
+        # Model performance statistical tests
+        backtest_results = self.results.get('backtesting', {})
+        if 'performance_metrics' in backtest_results:
+            metrics = backtest_results['performance_metrics']
+
+            # Sharpe ratio significance test
+            if 'sharpe_ratio' in metrics and 'returns_series' in backtest_results:
+                returns = np.array(backtest_results['returns_series'])
+                sharpe = metrics['sharpe_ratio']
+
+                # Test if Sharpe ratio is significantly different from zero
+                n_obs = len(returns)
+                sharpe_se = np.sqrt((1 + 0.5 * sharpe**2) / n_obs)
+                t_stat = sharpe / sharpe_se
+                p_value = 2 * (1 - stats.t.cdf(abs(t_stat), n_obs - 1))
+
+                report['model_performance_tests']['sharpe_ratio'] = {
+                    'test': 'Sharpe ratio significance test',
+                    'sharpe_ratio': float(sharpe),
+                    't_statistic': float(t_stat),
+                    'p_value': float(p_value),
+                    'significant': p_value < 0.05,
+                    'interpretation': self._interpret_sharpe_test(sharpe, p_value),
+                    'standard_error': float(sharpe_se)
+                }
+
+        # Hyperparameter significance analysis
+        if modeling_results and 'all_configurations' in modeling_results:
+            configs = modeling_results['all_configurations']
+
+            # Extract validation losses
+            val_losses = []
+            config_names = []
+            for name, result in configs.items():
+                if 'error' not in result and 'val_loss' in result:
+                    val_losses.append(result['val_loss'])
+                    config_names.append(name)
+
+            if len(val_losses) > 1:
+                # ANOVA test for significant differences between configurations
+                # Group by configuration type for analysis
+                lstm_groups = self._group_by_parameter(config_names, val_losses, 'lstm')
+                gnn_groups = self._group_by_parameter(config_names, val_losses, 'gnn')
+
+                for param_type, groups in [('lstm', lstm_groups), ('gnn', gnn_groups)]:
+                    if len(groups) > 1:
+                        group_values = list(groups.values())
+                        if all(len(g) > 0 for g in group_values):
+                            try:
+                                f_stat, p_value = stats.f_oneway(*group_values)
+                                report['hyperparameter_significance'][f'{param_type}_effect'] = {
+                                    'test': f'ANOVA for {param_type} parameter effect',
+                                    'f_statistic': float(f_stat),
+                                    'p_value': float(p_value),
+                                    'significant': p_value < 0.05,
+                                    'interpretation': self._interpret_anova(param_type, f_stat, p_value),
+                                    'groups_tested': list(groups.keys()),
+                                    'group_means': {k: float(np.mean(v)) for k, v in groups.items()}
+                                }
+                            except Exception as e:
+                                logger.warning(f"Failed to compute ANOVA for {param_type}: {e}")
+
+        # Economic significance tests
+        if 'performance_metrics' in backtest_results:
+            metrics = backtest_results['performance_metrics']
+
+            # Information ratio test
+            if 'information_ratio' in metrics:
+                ir = metrics['information_ratio']
+                report['economic_significance']['information_ratio'] = {
+                    'value': float(ir),
+                    'economically_significant': abs(ir) > 0.5,
+                    'interpretation': self._interpret_information_ratio(ir)
+                }
+
+            # Alpha significance
+            if 'alpha' in metrics and 'alpha_pvalue' in metrics:
+                alpha = metrics['alpha']
+                alpha_p = metrics['alpha_pvalue']
+                report['economic_significance']['alpha'] = {
+                    'value': float(alpha),
+                    'p_value': float(alpha_p),
+                    'significant': alpha_p < 0.05,
+                    'interpretation': self._interpret_alpha(alpha, alpha_p)
+                }
+
+        # Overall interpretation
+        report['interpretation'] = self._create_overall_interpretation(report)
+
+        return report
+
+    def _group_by_parameter(self, config_names, val_losses, param_type):
+        """Group validation losses by parameter type"""
+        groups = {}
+        for name, loss in zip(config_names, val_losses):
+            if param_type in name:
+                # Extract parameter value from name
+                parts = name.split('_')
+                param_idx = parts.index([p for p in parts if param_type in p][0])
+                if param_idx < len(parts):
+                    param_value = parts[param_idx]
+                    if param_value not in groups:
+                        groups[param_value] = []
+                    groups[param_value].append(loss)
+        return groups
+
+    def _interpret_spillover_test(self, t_stat, p_value):
+        """Interpret spillover significance test"""
+        if p_value < 0.001:
+            significance = "highly significant"
+        elif p_value < 0.01:
+            significance = "very significant"
+        elif p_value < 0.05:
+            significance = "significant"
+        else:
+            significance = "not significant"
+
+        direction = "positive" if t_stat > 0 else "negative"
+
+        return f"The spillover effects are {significance} (p={p_value:.4f}), indicating {direction} information transmission across subreddits."
+
+    def _interpret_sharpe_test(self, sharpe, p_value):
+        """Interpret Sharpe ratio significance test"""
+        if p_value < 0.05:
+            performance = "significantly different from zero"
+            if sharpe > 0:
+                quality = "indicating genuine risk-adjusted outperformance"
+            else:
+                quality = "indicating significant underperformance"
+        else:
+            performance = "not significantly different from zero"
+            quality = "suggesting performance may be due to random variation"
+
+        return f"The Sharpe ratio of {sharpe:.3f} is {performance} (p={p_value:.4f}), {quality}."
+
+    def _interpret_anova(self, param_type, f_stat, p_value):
+        """Interpret ANOVA results for hyperparameters"""
+        if p_value < 0.05:
+            return f"The {param_type} parameter choice significantly affects model performance (F={f_stat:.2f}, p={p_value:.4f}), indicating important hyperparameter sensitivity."
+        else:
+            return f"The {param_type} parameter choice does not significantly affect model performance (F={f_stat:.2f}, p={p_value:.4f}), suggesting robustness to this hyperparameter."
+
+    def _interpret_information_ratio(self, ir):
+        """Interpret information ratio"""
+        if abs(ir) > 1.0:
+            return f"Excellent active management skill with IR={ir:.3f}, indicating consistent alpha generation."
+        elif abs(ir) > 0.5:
+            return f"Good active management skill with IR={ir:.3f}, showing reliable outperformance."
+        else:
+            return f"Limited active management skill with IR={ir:.3f}, suggesting performance may be due to luck."
+
+    def _interpret_alpha(self, alpha, alpha_p):
+        """Interpret alpha significance"""
+        if alpha_p < 0.05:
+            if alpha > 0:
+                return f"Significant positive alpha of {alpha:.4f} (p={alpha_p:.4f}), indicating genuine skill in generating excess returns."
+            else:
+                return f"Significant negative alpha of {alpha:.4f} (p={alpha_p:.4f}), indicating systematic underperformance."
+        else:
+            return f"Alpha of {alpha:.4f} is not statistically significant (p={alpha_p:.4f}), suggesting performance may be due to chance."
+
+    def _create_overall_interpretation(self, report):
+        """Create overall interpretation of statistical results"""
+        interpretations = []
+
+        # Spillover interpretation
+        spillover = report.get('spillover_tests', {}).get('overall_spillover', {})
+        if spillover.get('significant'):
+            interpretations.append("✓ Spillover Effects: Statistically significant information transmission detected across subreddits")
+        else:
+            interpretations.append("✗ Spillover Effects: No significant spillover effects detected")
+
+        # Performance interpretation
+        sharpe = report.get('model_performance_tests', {}).get('sharpe_ratio', {})
+        if sharpe.get('significant') and sharpe.get('sharpe_ratio', 0) > 0:
+            interpretations.append("✓ Risk-Adjusted Performance: Strategy demonstrates significant risk-adjusted outperformance")
+        else:
+            interpretations.append("✗ Risk-Adjusted Performance: No significant risk-adjusted outperformance detected")
+
+        # Hyperparameter interpretation
+        hyper_tests = report.get('hyperparameter_significance', {})
+        significant_params = [k for k, v in hyper_tests.items() if v.get('significant')]
+        if significant_params:
+            interpretations.append(f"✓ Hyperparameter Sensitivity: {', '.join(significant_params)} show significant impact on performance")
+        else:
+            interpretations.append("✗ Hyperparameter Sensitivity: Model performance appears robust to hyperparameter choices")
+
+        # Economic significance
+        economic = report.get('economic_significance', {})
+        alpha_sig = economic.get('alpha', {}).get('significant', False)
+        ir_sig = economic.get('information_ratio', {}).get('economically_significant', False)
+
+        if alpha_sig or ir_sig:
+            interpretations.append("✓ Economic Significance: Strategy shows economically meaningful outperformance")
+        else:
+            interpretations.append("✗ Economic Significance: Limited evidence of economically meaningful outperformance")
+
+        return interpretations
+
+    def _create_detailed_statistical_report(self, statistical_report):
+        """Create detailed statistical significance report in markdown"""
+
+        content = f"""
+# Statistical Significance Analysis Report
+
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## Executive Summary
+
+{chr(10).join(f"- {interp}" for interp in statistical_report.get('interpretation', []))}
+
+## Detailed Statistical Tests
+
+### 1. Spillover Effect Significance
+
+"""
+
+        spillover = statistical_report.get('spillover_tests', {}).get('overall_spillover', {})
+        if spillover:
+            content += f"""
+**Test:** {spillover.get('test', 'N/A')}
+- **t-statistic:** {spillover.get('t_statistic', 0):.4f}
+- **p-value:** {spillover.get('p_value', 1):.4f}
+- **Significant:** {'Yes' if spillover.get('significant') else 'No'}
+- **Effect Size:** {spillover.get('effect_size', 0):.4f}
+- **95% CI:** [{spillover.get('confidence_interval', [0, 0])[0]:.4f}, {spillover.get('confidence_interval', [0, 0])[1]:.4f}]
+
+**Interpretation:** {spillover.get('interpretation', 'No interpretation available')}
+
+"""
+
+        content += "### 2. Model Performance Tests\n\n"
+
+        sharpe = statistical_report.get('model_performance_tests', {}).get('sharpe_ratio', {})
+        if sharpe:
+            content += f"""
+**Sharpe Ratio Significance Test**
+- **Sharpe Ratio:** {sharpe.get('sharpe_ratio', 0):.4f}
+- **t-statistic:** {sharpe.get('t_statistic', 0):.4f}
+- **p-value:** {sharpe.get('p_value', 1):.4f}
+- **Significant:** {'Yes' if sharpe.get('significant') else 'No'}
+- **Standard Error:** {sharpe.get('standard_error', 0):.4f}
+
+**Interpretation:** {sharpe.get('interpretation', 'No interpretation available')}
+
+"""
+
+        content += "### 3. Hyperparameter Significance\n\n"
+
+        hyper_tests = statistical_report.get('hyperparameter_significance', {})
+        for param_name, test_result in hyper_tests.items():
+            content += f"""
+**{test_result.get('test', param_name)}**
+- **F-statistic:** {test_result.get('f_statistic', 0):.4f}
+- **p-value:** {test_result.get('p_value', 1):.4f}
+- **Significant:** {'Yes' if test_result.get('significant') else 'No'}
+- **Groups:** {', '.join(test_result.get('groups_tested', []))}
+
+**Group Means:**
+{chr(10).join(f"- {k}: {v:.4f}" for k, v in test_result.get('group_means', {}).items())}
+
+**Interpretation:** {test_result.get('interpretation', 'No interpretation available')}
+
+"""
+
+        content += "### 4. Economic Significance\n\n"
+
+        economic = statistical_report.get('economic_significance', {})
+        for metric_name, metric_data in economic.items():
+            content += f"""
+**{metric_name.replace('_', ' ').title()}**
+- **Value:** {metric_data.get('value', 0):.4f}
+"""
+            if 'p_value' in metric_data:
+                content += f"- **p-value:** {metric_data.get('p_value', 1):.4f}\n"
+                content += f"- **Significant:** {'Yes' if metric_data.get('significant') else 'No'}\n"
+            if 'economically_significant' in metric_data:
+                content += f"- **Economically Significant:** {'Yes' if metric_data.get('economically_significant') else 'No'}\n"
+
+            content += f"\n**Interpretation:** {metric_data.get('interpretation', 'No interpretation available')}\n\n"
+
+        content += """
+## Methodology Notes
+
+### Statistical Tests Used
+
+1. **One-sample t-test:** Used to test if spillover effects are significantly different from zero
+2. **Sharpe Ratio Test:** Tests if risk-adjusted returns are significantly different from zero
+3. **ANOVA (Analysis of Variance):** Tests for significant differences between hyperparameter groups
+4. **Alpha Regression:** Tests for significant excess returns over benchmark
+
+### Significance Levels
+
+- **p < 0.001:** Highly significant (⭐⭐⭐)
+- **p < 0.01:** Very significant (⭐⭐)
+- **p < 0.05:** Significant (⭐)
+- **p ≥ 0.05:** Not significant
+
+### Economic Significance Thresholds
+
+- **Information Ratio > 0.5:** Economically meaningful
+- **|Alpha| with p < 0.05:** Statistically and economically significant
+
+---
+
+*This statistical report provides rigorous analysis of model significance and economic value.*
+"""
+
+        with open(self.output_dir / "statistical_significance_report.md", 'w') as f:
+            f.write(content)
+
+        logger.info("Detailed statistical significance report saved")
+
         with open(self.output_dir / "report.md", 'w') as f:
             f.write(markdown_content)
 
     def run_complete_pipeline(self):
-        """Execute the complete analysis pipeline"""
+        """Execute the complete analysis pipeline with hyperparameter optimization"""
 
         logger.info("🚀 STARTING HIERARCHICAL SENTIMENT SPILLOVER ANALYSIS PIPELINE")
         logger.info("=" * 80)
@@ -810,7 +1196,7 @@ class HierarchicalSentimentPipeline:
             backtest_results = self.step_4_economic_evaluation(processed_data, spillover_results)
 
             # Step 5: Generate Report
-            self.step_5_generate_report()
+            self.step_5_generate_report(modeling_results)
 
             pipeline_end_time = datetime.now()
             total_time = pipeline_end_time - pipeline_start_time
@@ -837,20 +1223,51 @@ class HierarchicalSentimentPipeline:
 
 
 def main():
-    """Main function to run the pipeline"""
+    """Main function to run the pipeline with hyperparameter optimization"""
+
+    import argparse
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Hierarchical Sentiment Spillover Analysis Pipeline")
+    parser.add_argument("--config", default="experiments/configs/hierarchical_config.yaml",
+                       help="Path to main configuration file")
+    parser.add_argument("--hyperparameter-sets", default="experiments/configs/hyperparameter_sets.yaml",
+                       help="Path to hyperparameter sets file (optional)")
+    parser.add_argument("--single-config", action="store_true",
+                       help="Run with single configuration only (ignore hyperparameter sets)")
+
+    args = parser.parse_args()
 
     # Configuration file path
-    config_path = "experiments/configs/hierarchical_config.yaml"
+    config_path = args.config
+    hyperparameter_sets_path = args.hyperparameter_sets if not args.single_config else None
 
-    # Check if config exists
+    # Check if main config exists
     if not Path(config_path).exists():
         logger.error(f"Configuration file not found: {config_path}")
         logger.info("Please create the configuration file first")
         return
 
+    # Check hyperparameter sets
+    use_hyperparameter_sets = False
+    if hyperparameter_sets_path and Path(hyperparameter_sets_path).exists():
+        use_hyperparameter_sets = True
+        logger.info(f"Using hyperparameter sets from: {hyperparameter_sets_path}")
+    else:
+        logger.info("Running with single configuration (hyperparameter sets not found or disabled)")
+        hyperparameter_sets_path = None
+
     try:
-        # Initialize and run pipeline
-        pipeline = HierarchicalSentimentPipeline(config_path)
+        # Initialize pipeline
+        pipeline = HierarchicalSentimentPipeline(config_path, hyperparameter_sets_path)
+
+        # Log pipeline mode
+        if use_hyperparameter_sets:
+            logger.info("🔬 HYPERPARAMETER OPTIMIZATION MODE: Testing multiple configurations")
+        else:
+            logger.info("⚡ SINGLE CONFIGURATION MODE: Using default parameters")
+
+        # Run pipeline
         results = pipeline.run_complete_pipeline()
 
         print("\n" + "="*80)
@@ -860,16 +1277,36 @@ def main():
         print(f"💾 Output directory: {results['output_directory']}")
         print(f"📈 Data shape: {results['processed_data'].shape}")
 
+        # Hyperparameter optimization summary
+        if 'modeling_results' in results and isinstance(results['modeling_results'], dict):
+            modeling_results = results['modeling_results']
+
+            if 'total_configurations_tested' in modeling_results:
+                print(f"🔬 Configurations tested: {modeling_results['total_configurations_tested']}")
+
+                best_config = modeling_results.get('best_configuration', {})
+                if best_config and 'name' in best_config:
+                    print(f"🏆 Best configuration: {best_config['name']}")
+                    print(f"📉 Best validation loss: {best_config.get('val_loss', 'N/A'):.4f}")
+
+        # Spillover results
         if 'spillover_results' in results:
             spillover_idx = results['spillover_results'].get('static', {}).get('total_spillover_index', 0)
             print(f"🔄 Total spillover index: {spillover_idx:.2f}%")
 
+        # Economic performance
         if 'backtest_results' in results:
             metrics = results['backtest_results'].get('performance_metrics', {})
             if metrics:
                 print(f"📊 Annual return: {metrics.get('annual_return', 0):.2%}")
                 print(f"📊 Sharpe ratio: {metrics.get('sharpe_ratio', 0):.3f}")
+                if 'alpha' in metrics:
+                    print(f"📊 Alpha: {metrics['alpha']:.2%}")
 
+        print(f"📋 Reports generated:")
+        print(f"   • Comprehensive report: {results['output_directory']}/comprehensive_report.json")
+        print(f"   • Markdown report: {results['output_directory']}/report.md")
+        print(f"   • Statistical analysis: {results['output_directory']}/statistical_significance_report.md")
         print("="*80)
 
     except Exception as e:

@@ -9,7 +9,7 @@ Based on academic methodology for financial spillover analysis
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 import torch_geometric
 from torch_geometric.nn import GCNConv, GATConv, GatedGraphConv
 from torch_geometric.data import Data, Batch
@@ -27,6 +27,7 @@ import logging
 from pathlib import Path
 import pickle
 import json
+import random
 
 # Transformers for attention mechanism
 from transformers import AutoModel, AutoConfig
@@ -51,22 +52,32 @@ class SubredditTimeSeriesDataset(Dataset):
 
         # Filter data for specific subreddit
         self.data = df[df['subreddit'] == subreddit].copy()
-        self.data = self.data.sort_values('created_utc').reset_index(drop=True)
+        # Use correct timestamp column
+        timestamp_col = 'created_utc' if 'created_utc' in self.data.columns else 'post_created_utc'
+        self.data = self.data.sort_values(timestamp_col).reset_index(drop=True)
 
-        # Define features and targets
+        # Define features and targets - only include numeric columns
         if feature_columns is None:
-            self.feature_columns = [col for col in df.columns if any(
+            candidate_columns = [col for col in df.columns if any(
                 pattern in col for pattern in ['sentiment_', 'emotion_', 'ratio_', 'count_', 'net_spillover', 'pagerank']
             )]
+            # Filter to only numeric columns
+            self.feature_columns = [col for col in candidate_columns
+                                  if col in self.data.columns and
+                                  self.data[col].dtype in ['int64', 'float64', 'int32', 'float32']]
         else:
             self.feature_columns = feature_columns
 
         if target_columns is None:
-            self.target_columns = ['next_sentiment', 'sentiment_change', 'next_return', 'return_direction']
+            candidate_targets = ['next_sentiment', 'sentiment_change', 'next_return', 'return_direction']
+            # Filter to only numeric target columns that exist
+            self.target_columns = [col for col in candidate_targets
+                                 if col in self.data.columns and
+                                 self.data[col].dtype in ['int64', 'float64', 'int32', 'float32']]
         else:
             self.target_columns = target_columns
 
-        # Remove missing target columns
+        # Remove missing target columns (additional safety)
         self.target_columns = [col for col in self.target_columns if col in self.data.columns]
 
         # Prepare sequences
@@ -75,9 +86,9 @@ class SubredditTimeSeriesDataset(Dataset):
     def _prepare_sequences(self):
         """Prepare sliding window sequences"""
 
-        # Extract feature and target arrays
-        features = self.data[self.feature_columns].values
-        targets = self.data[self.target_columns].values
+        # Extract feature and target arrays - force numeric conversion
+        features = self.data[self.feature_columns].apply(pd.to_numeric, errors='coerce').values
+        targets = self.data[self.target_columns].apply(pd.to_numeric, errors='coerce').values
 
         # Handle missing values
         features = np.nan_to_num(features, nan=0.0)
@@ -107,6 +118,156 @@ class SubredditTimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         return torch.FloatTensor(self.sequences[idx]), torch.FloatTensor(self.targets[idx])
+
+
+class HierarchicalBatchSampler(Sampler):
+    """
+    Custom batch sampler for hierarchical model
+    Samples from multiple subreddit datasets to create balanced batches
+    """
+
+    def __init__(self, datasets: Dict[str, SubredditTimeSeriesDataset],
+                 batch_size: int = 32, shuffle: bool = True):
+        self.datasets = datasets
+        self.subreddits = list(datasets.keys())
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+        # Calculate total samples and samples per subreddit
+        self.total_samples = sum(len(ds) for ds in datasets.values())
+        self.samples_per_subreddit = {sr: len(ds) for sr, ds in datasets.items()}
+
+        # Calculate how many samples from each subreddit per batch
+        self.samples_per_batch = max(1, batch_size // len(self.subreddits))
+
+    def __iter__(self):
+        if self.shuffle:
+            # Create shuffled indices for each subreddit
+            subreddit_indices = {}
+            for subreddit in self.subreddits:
+                indices = list(range(len(self.datasets[subreddit])))
+                random.shuffle(indices)
+                subreddit_indices[subreddit] = indices
+        else:
+            subreddit_indices = {sr: list(range(len(ds)))
+                               for sr, ds in self.datasets.items()}
+
+        # Track current position for each subreddit
+        positions = {sr: 0 for sr in self.subreddits}
+
+        while any(positions[sr] < len(subreddit_indices[sr]) for sr in self.subreddits):
+            batch = []
+
+            for subreddit in self.subreddits:
+                if positions[subreddit] < len(subreddit_indices[subreddit]):
+                    # Take samples_per_batch samples from this subreddit
+                    end_pos = min(positions[subreddit] + self.samples_per_batch,
+                                 len(subreddit_indices[subreddit]))
+
+                    for i in range(positions[subreddit], end_pos):
+                        batch.append((subreddit, subreddit_indices[subreddit][i]))
+
+                    positions[subreddit] = end_pos
+
+            if batch:
+                yield batch
+
+    def __len__(self):
+        return self.total_samples // self.batch_size
+
+
+class HierarchicalDataset(Dataset):
+    """
+    Wrapper dataset that combines multiple subreddit datasets
+    """
+
+    def __init__(self, datasets: Dict[str, SubredditTimeSeriesDataset]):
+        self.datasets = datasets
+        self.subreddits = list(datasets.keys())
+        # Create index mapping
+        self.index_map = []
+        for subreddit, dataset in datasets.items():
+            for idx in range(len(dataset)):
+                self.index_map.append((subreddit, idx))
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, idx):
+        subreddit, dataset_idx = self.index_map[idx]
+        return subreddit, dataset_idx
+
+
+class HierarchicalCollator:
+    """
+    Collator class for hierarchical batches that has access to datasets
+    """
+
+    def __init__(self, datasets: Dict[str, SubredditTimeSeriesDataset],
+                 network: nx.DiGraph = None):
+        self.datasets = datasets
+        self.network = network
+        self.subreddits = list(datasets.keys())
+
+    def __call__(self, batch_items):
+        """
+        Custom collate function for hierarchical batches
+        """
+        subreddit_data = {}
+        all_targets = []
+
+        # Group by subreddit
+        subreddit_batches = {}
+        for subreddit, idx in batch_items:
+            if subreddit not in subreddit_batches:
+                subreddit_batches[subreddit] = []
+            subreddit_batches[subreddit].append(idx)
+
+        # Extract actual data for each subreddit
+        for subreddit, indices in subreddit_batches.items():
+            if subreddit in self.datasets:
+                # Get data for this subreddit
+                sequences = []
+                targets = []
+
+                for idx in indices:
+                    seq, target = self.datasets[subreddit][idx]
+                    sequences.append(seq)
+                    targets.append(target)
+
+                if sequences:
+                    subreddit_data[subreddit] = torch.stack(sequences)
+                    all_targets.extend(targets)
+
+        # Create graph data if network is available
+        graph_data = self._create_graph_data() if self.network else None
+
+        # Stack all targets
+        if all_targets:
+            targets_tensor = torch.stack(all_targets)
+        else:
+            targets_tensor = torch.empty(0)
+
+        return subreddit_data, graph_data, targets_tensor
+
+    def _create_graph_data(self):
+        """Create graph representation from network"""
+        if not self.network:
+            return None
+
+        # Simple adjacency matrix for now
+        num_nodes = len(self.subreddits)
+        adj_matrix = torch.zeros(num_nodes, num_nodes)
+
+        subreddit_to_idx = {sr: i for i, sr in enumerate(self.subreddits)}
+
+        # Fill adjacency matrix based on network edges
+        for u, v, data in self.network.edges(data=True):
+            if u in subreddit_to_idx and v in subreddit_to_idx:
+                i, j = subreddit_to_idx[u], subreddit_to_idx[v]
+                adj_matrix[i, j] = data.get('weight', 1.0)
+
+        return adj_matrix
 
 
 class SubredditLSTM(nn.Module):
@@ -459,8 +620,8 @@ class HierarchicalSentimentModel(pl.LightningModule):
         return final_predictions
 
     def training_step(self, batch, batch_idx):
+        """Training step with proper hierarchical batch structure"""
         subreddit_data, graph_data, targets = batch
-
         predictions = self(subreddit_data, graph_data)
 
         # Multi-task loss
@@ -478,8 +639,8 @@ class HierarchicalSentimentModel(pl.LightningModule):
         return total_loss
 
     def validation_step(self, batch, batch_idx):
+        """Validation step with proper hierarchical batch structure"""
         subreddit_data, graph_data, targets = batch
-
         predictions = self(subreddit_data, graph_data)
 
         # Multi-task loss
@@ -511,7 +672,7 @@ class HierarchicalSentimentModel(pl.LightningModule):
         )
 
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+            optimizer, mode='min', factor=0.5, patience=5
         )
 
         return {
@@ -628,8 +789,9 @@ class HierarchicalDataModule(pl.LightningDataModule):
     def setup(self, stage: str = None):
         """Setup train/val/test datasets"""
 
-        # Time-based split
-        data_sorted = self.processed_data.sort_values('created_utc')
+        # Time-based split - use correct timestamp column
+        timestamp_col = 'created_utc' if 'created_utc' in self.processed_data.columns else 'post_created_utc'
+        data_sorted = self.processed_data.sort_values(timestamp_col)
 
         train_end = int(0.7 * len(data_sorted))
         val_end = int(0.85 * len(data_sorted))
@@ -680,32 +842,90 @@ class HierarchicalDataModule(pl.LightningDataModule):
             )
 
     def train_dataloader(self):
-        # For now, return the first subreddit's dataloader
-        # In practice, you'd implement custom batching across subreddits
-        first_subreddit = list(self.train_datasets.keys())[0]
-        return DataLoader(
-            self.train_datasets[first_subreddit],
+        """Create hierarchical DataLoader for training"""
+        if not self.train_datasets:
+            raise ValueError("No training datasets available. Run setup() first.")
+
+        # Create hierarchical dataset wrapper
+        hierarchical_dataset = HierarchicalDataset(self.train_datasets)
+
+        # Create custom batch sampler
+        batch_sampler = HierarchicalBatchSampler(
+            datasets=self.train_datasets,
             batch_size=self.config.get('batch_size', 32),
-            shuffle=True,
-            num_workers=self.config.get('num_workers', 4)
+            shuffle=True
+        )
+
+        # Create custom collator
+        collator = HierarchicalCollator(
+            datasets=self.train_datasets,
+            network=self.network
+        )
+
+        # Create DataLoader with custom sampler and collator
+        return DataLoader(
+            dataset=hierarchical_dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collator,
+            num_workers=self.config.get('num_workers', 0)  # Set to 0 for custom sampler
         )
 
     def val_dataloader(self):
-        first_subreddit = list(self.val_datasets.keys())[0]
-        return DataLoader(
-            self.val_datasets[first_subreddit],
+        """Create hierarchical DataLoader for validation"""
+        if not self.val_datasets:
+            raise ValueError("No validation datasets available. Run setup() first.")
+
+        # Create hierarchical dataset wrapper
+        hierarchical_dataset = HierarchicalDataset(self.val_datasets)
+
+        # Create custom batch sampler
+        batch_sampler = HierarchicalBatchSampler(
+            datasets=self.val_datasets,
             batch_size=self.config.get('batch_size', 32),
-            shuffle=False,
-            num_workers=self.config.get('num_workers', 4)
+            shuffle=False
+        )
+
+        # Create custom collator
+        collator = HierarchicalCollator(
+            datasets=self.val_datasets,
+            network=self.network
+        )
+
+        # Create DataLoader with custom sampler and collator
+        return DataLoader(
+            dataset=hierarchical_dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collator,
+            num_workers=self.config.get('num_workers', 0)  # Set to 0 for custom sampler
         )
 
     def test_dataloader(self):
-        first_subreddit = list(self.test_datasets.keys())[0]
-        return DataLoader(
-            self.test_datasets[first_subreddit],
+        """Create hierarchical DataLoader for testing"""
+        if not self.test_datasets:
+            raise ValueError("No test datasets available. Run setup() first.")
+
+        # Create hierarchical dataset wrapper
+        hierarchical_dataset = HierarchicalDataset(self.test_datasets)
+
+        # Create custom batch sampler
+        batch_sampler = HierarchicalBatchSampler(
+            datasets=self.test_datasets,
             batch_size=self.config.get('batch_size', 32),
-            shuffle=False,
-            num_workers=self.config.get('num_workers', 4)
+            shuffle=False
+        )
+
+        # Create custom collator
+        collator = HierarchicalCollator(
+            datasets=self.test_datasets,
+            network=self.network
+        )
+
+        # Create DataLoader with custom sampler and collator
+        return DataLoader(
+            dataset=hierarchical_dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collator,
+            num_workers=self.config.get('num_workers', 0)  # Set to 0 for custom sampler
         )
 
 

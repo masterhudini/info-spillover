@@ -1,0 +1,82 @@
+advanced:
+  enable_feature_selection: false
+  enable_hyperparameter_tuning: false
+  use_gpu: false
+backtesting:
+  initial_capital: 10000
+  lookback_period: 10
+  max_position_size: 0.1
+  min_observations: 5
+  rebalancing_frequency: weekly
+  transaction_cost: 0.001
+computing:
+  chunk_size: 100
+  n_jobs: 1
+data:
+  bigquery:
+    dataset_id: spillover_statistical_test
+    project_id: informationspillover
+  end_date: '2023-03-31'
+  preprocessing:
+    max_missing_ratio: 0.5
+    min_observations_per_subreddit: 10
+    outlier_removal: true
+    outlier_threshold: 3.0
+    stationarity_transformation: first_difference
+  start_date: '2023-01-01'
+experiment:
+  description: Small test run
+  name: test_small_pipeline
+  version: '1.0'
+feature_engineering:
+  network_construction:
+    causality_lags: 3
+    min_connections: 2
+  sentiment_analysis:
+    batch_size: 100
+    enabled: true
+  temporal_windows:
+  - 1
+  - 6
+generate_plots: true
+hierarchical_model:
+  attention_heads: 2
+  batch_size: 16
+  dropout: 0.2
+  early_stopping_patience: 3
+  gnn_hidden_dim: 16
+  gnn_num_layers: 1
+  gnn_type: GCN
+  hidden_dim: 32
+  learning_rate: 0.01
+  max_epochs: 5
+  num_layers: 1
+  subreddit_model_type: lstm
+logging:
+  level: INFO
+mlflow:
+  experiment_name: test_small_pipeline
+  run_name: test_run_20250925_110231
+  tracking_uri: sqlite:///test_mlflow.db
+monitoring:
+  enable_progress_tracking: true
+  log_frequency: 10
+numpy_seed: 42
+output_dir: test_results
+plot_config:
+  dpi: 100
+  figure_size:
+  - 8
+  - 6
+random_state: 42
+save_intermediate_results: true
+spillover:
+  dynamic_analysis: true
+  forecast_horizon: 5
+  rolling_window: 30
+  var_lags: 2
+  window_size: 30
+torch_seed: 42
+validation:
+  cross_validation_folds: 2
+  test_split_ratio: 0.2

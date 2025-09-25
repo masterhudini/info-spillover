@@ -36,7 +36,7 @@ class DataQualityValidator:
     def __init__(self):
         self.quality_report = {}
 
-    def validate_timestamps(self, df: pd.DataFrame, timestamp_col: str = 'created_utc') -> Dict:
+    def validate_timestamps(self, df: pd.DataFrame, timestamp_col: str = 'post_created_utc') -> Dict:
         """Validate timestamp consistency and gaps"""
         logger.info("Validating timestamp quality...")
 
@@ -128,7 +128,7 @@ class DataQualityValidator:
         subreddit_counts = df[subreddit_col].value_counts()
 
         # Temporal coverage per subreddit
-        temporal_coverage = df.groupby(subreddit_col)['created_utc'].agg([
+        temporal_coverage = df.groupby(subreddit_col)['post_created_utc'].agg([
             'min', 'max', 'count'
         ])
         temporal_coverage['span_days'] = (temporal_coverage['max'] -
@@ -224,7 +224,7 @@ class HierarchicalFeatureEngineer:
         logger.info("Computing temporal aggregates...")
 
         # Ensure proper datetime index
-        df = df.set_index('created_utc').sort_index()
+        df = df.set_index('post_created_utc').sort_index()
 
         # Initialize results container
         aggregated_features = []
@@ -234,12 +234,12 @@ class HierarchicalFeatureEngineer:
 
             subreddit_data = df[df['subreddit'] == subreddit].copy()
 
-            # For each time window
+            # For each time window (convert hours to periods - assuming data is roughly hourly)
             for window_h in self.window_hours:
-                window_str = f'{window_h}H'
+                window_periods = max(1, window_h)  # Use hours as periods directly
 
                 # Rolling statistics
-                rolling = subreddit_data['compound_sentiment'].rolling(window_str, min_periods=1)
+                rolling = subreddit_data['compound_sentiment'].rolling(window_periods, min_periods=1)
 
                 subreddit_data[f'sentiment_mean_{window_h}h'] = rolling.mean()
                 subreddit_data[f'sentiment_std_{window_h}h'] = rolling.std()
@@ -250,8 +250,8 @@ class HierarchicalFeatureEngineer:
 
                 # Volume-weighted sentiment
                 if 'score' in subreddit_data.columns:  # post score as volume proxy
-                    weights = subreddit_data['score'].rolling(window_str, min_periods=1)
-                    sentiment_vol = subreddit_data['compound_sentiment'].rolling(window_str, min_periods=1)
+                    weights = subreddit_data['score'].rolling(window_periods, min_periods=1)
+                    sentiment_vol = subreddit_data['compound_sentiment'].rolling(window_periods, min_periods=1)
 
                     subreddit_data[f'vwsentiment_{window_h}h'] = (
                         (sentiment_vol.mean() * weights.mean()) / weights.mean()
@@ -260,7 +260,7 @@ class HierarchicalFeatureEngineer:
                 # Activity metrics - since created_utc is already the index, don't specify 'on'
                 try:
                     subreddit_data[f'post_count_{window_h}h'] = subreddit_data.rolling(
-                        window_str, min_periods=1
+                        window_periods, min_periods=1
                     ).size()
                 except Exception:
                     # Simple fallback - use expanding window count
@@ -268,7 +268,7 @@ class HierarchicalFeatureEngineer:
 
                 # Emotion ratios
                 for emotion in ['fear', 'greed', 'fomo']:
-                    emotion_rolling = subreddit_data[f'{emotion}_score'].rolling(window_str, min_periods=1)
+                    emotion_rolling = subreddit_data[f'{emotion}_score'].rolling(window_periods, min_periods=1)
                     subreddit_data[f'{emotion}_ratio_{window_h}h'] = emotion_rolling.mean()
 
             aggregated_features.append(subreddit_data)
@@ -299,7 +299,16 @@ class GrangerCausalityNetworkBuilder:
 
         for subreddit in df['subreddit'].unique():
             subreddit_data = df[df['subreddit'] == subreddit].copy()
-            subreddit_data = subreddit_data.set_index('created_utc').sort_index()
+            # Use the correct timestamp column name
+            timestamp_col = 'created_utc' if 'created_utc' in subreddit_data.columns else 'post_created_utc'
+
+            # Ensure timestamp column is datetime
+            if timestamp_col in subreddit_data.columns:
+                subreddit_data[timestamp_col] = pd.to_datetime(subreddit_data[timestamp_col])
+                subreddit_data = subreddit_data.set_index(timestamp_col).sort_index()
+            else:
+                logger.warning(f"No valid timestamp column found for {subreddit}, skipping network analysis")
+                continue
 
             # Resample to regular frequency, forward-fill missing values
             ts = subreddit_data['compound_sentiment'].resample(freq).mean()
@@ -456,10 +465,12 @@ class HierarchicalDataProcessor:
     Main processor combining all hierarchical data processing components
     """
 
-    def __init__(self, bigquery_client: BigQueryClient = None):
+    def __init__(self, bigquery_client: BigQueryClient = None, temporal_windows: List[int] = None):
         self.bq_client = bigquery_client or BigQueryClient()
         self.validator = DataQualityValidator()
-        self.feature_engineer = HierarchicalFeatureEngineer()
+        # Use provided temporal windows or default
+        window_hours = temporal_windows or [1, 6, 24]
+        self.feature_engineer = HierarchicalFeatureEngineer(window_hours=window_hours)
         self.network_builder = GrangerCausalityNetworkBuilder()
 
         self.processing_log = {}
@@ -472,12 +483,40 @@ class HierarchicalDataProcessor:
         # Load raw data
         if hasattr(self.bq_client, 'get_post_sentiment_aggregation'):
             df = self.bq_client.get_post_sentiment_aggregation(start_date, end_date)
+            # Rename 'date' to 'post_created_utc' for consistency
+            if 'date' in df.columns:
+                df = df.rename(columns={'date': 'post_created_utc'})
+
+            # Create compound sentiment from aggregated sentiments
+            if 'avg_positive_sentiment' in df.columns:
+                df['compound_sentiment'] = (
+                    df['avg_positive_sentiment'].fillna(0) -
+                    df['avg_negative_sentiment'].fillna(0)
+                )
+
+            # Map other columns for consistency
+            column_mapping = {
+                'avg_post_score': 'score',
+                'num_posts': 'post_count',
+                'num_comments': 'comment_count'
+            }
+            df = df.rename(columns=column_mapping)
+
+            # For aggregated data, create sentiment_score from compound_sentiment
+            if 'compound_sentiment' in df.columns and 'sentiment_score' not in df.columns:
+                df['sentiment_score'] = df['compound_sentiment']
+
+            # Create sentiment_label from compound_sentiment
+            if 'compound_sentiment' in df.columns and 'sentiment_label' not in df.columns:
+                df['sentiment_label'] = df['compound_sentiment'].apply(
+                    lambda x: 'positive' if x > 0.1 else ('negative' if x < -0.1 else 'neutral')
+                )
         else:
             # Fallback query
             query = f"""
             SELECT
                 subreddit,
-                post_created_utc as created_utc,
+                post_created_utc,
                 comment_sentiment_label as sentiment_label,
                 comment_sentiment_score as sentiment_score,
                 comment_body as text,
@@ -598,24 +637,37 @@ class HierarchicalDataProcessor:
 
         # If price data is provided, create price-based targets
         if price_data is not None:
+            # Ensure compatible datetime types for merging (standardize to ns precision)
+            if 'post_created_utc' in df.columns:
+                df['post_created_utc'] = pd.to_datetime(df['post_created_utc']).dt.tz_localize(None).astype('datetime64[ns]')
+            if 'created_utc' in df.columns:
+                df['created_utc'] = pd.to_datetime(df['created_utc']).dt.tz_localize(None).astype('datetime64[ns]')
+
+            if 'snapped_at' in price_data.columns:
+                price_data['snapped_at'] = pd.to_datetime(price_data['snapped_at']).dt.tz_localize(None).astype('datetime64[ns]')
+
+            # Use the correct timestamp column
+            timestamp_col = 'created_utc' if 'created_utc' in df.columns else 'post_created_utc'
+
             # Merge with price data (assuming it has timestamp alignment)
             df = pd.merge_asof(
-                df.sort_values('created_utc'),
+                df.sort_values(timestamp_col),
                 price_data.sort_values('snapped_at'),
-                left_on='created_utc',
+                left_on=timestamp_col,
                 right_on='snapped_at',
                 direction='nearest',
                 tolerance=pd.Timedelta('1H')
             )
 
             # Create price return targets
-            df = df.sort_values(['symbol', 'created_utc'])
+            df = df.sort_values(['symbol', timestamp_col])
             df['next_return'] = df.groupby('symbol')['price'].pct_change().shift(-1)
             df['return_direction'] = np.where(df['next_return'] > 0.001, 1,
                                     np.where(df['next_return'] < -0.001, -1, 0))
 
-        # Create sentiment-based targets
-        df = df.sort_values(['subreddit', 'created_utc'])
+        # Create sentiment-based targets - use correct timestamp column
+        timestamp_col = 'created_utc' if 'created_utc' in df.columns else 'post_created_utc'
+        df = df.sort_values(['subreddit', timestamp_col])
         df['next_sentiment'] = df.groupby('subreddit')['compound_sentiment'].shift(-1)
         df['sentiment_change'] = df['next_sentiment'] - df['compound_sentiment']
 
@@ -646,7 +698,7 @@ class HierarchicalDataProcessor:
                 df = self.create_targets(df)
 
             # Final cleanup
-            df = df.dropna(subset=['compound_sentiment', 'created_utc'])
+            df = df.dropna(subset=['compound_sentiment', 'post_created_utc'])
 
             processing_time = datetime.now() - start_time
 

@@ -1,0 +1,105 @@
+# Quick test configuration for pipeline
+experiment:
+  name: "quick_test_pipeline"
+  description: "Quick test with limited data"
+  version: "1.0"
+  tags:
+    - "test"
+    - "quick"
+
+# Data configuration - limited to 2021 only
+data:
+  start_date: "2021-01-01"
+  end_date: "2021-12-31"
+  bigquery:
+    project_id: "informationspillover"
+    dataset_id: "spillover_statistical_test"
+  preprocessing:
+    min_observations_per_subreddit: 5  # Lower threshold for test
+    max_missing_ratio: 0.5
+    stationarity_transformation: "first_difference"
+    outlier_removal: true
+    outlier_threshold: 3.0
+
+# Minimal feature engineering
+feature_engineering:
+  temporal_windows: [1, 6]  # Just two windows
+  sentiment_analysis:
+    enabled: true
+    batch_size: 50
+  network_construction:
+    min_connections: 2
+    causality_lags: 2
+
+# Fast spillover analysis
+spillover:
+  forecast_horizon: 3  # Short horizon
+  var_lags: 2         # Few lags
+  rolling_window: 30  # Small window
+  dynamic_analysis: true
+  window_size: 30
+
+# Small model for quick test
+hierarchical_model:
+  subreddit_model_type: "lstm"
+  hidden_dim: 16      # Very small
+  num_layers: 1       # Single layer
+  dropout: 0.2
+  learning_rate: 0.01
+  batch_size: 8       # Small batches
+  max_epochs: 2       # Just 2 epochs
+  early_stopping_patience: 2
+  gnn_hidden_dim: 8   # Tiny GNN
+  gnn_num_layers: 1
+  gnn_type: "GCN"
+  attention_heads: 2
+
+# Quick backtesting
+backtesting:
+  initial_capital: 10000
+  transaction_cost: 0.001
+  max_position_size: 0.1
+  rebalancing_frequency: "weekly"
+  lookback_period: 5  # Short lookback
+  min_observations: 3
+
+# MLflow settings
+mlflow:
+  tracking_uri: "sqlite:///test_quick.db"
+  experiment_name: "quick_test_pipeline"
+  run_name: "quick_test_run"
+
+# Output settings
+output_dir: "test_quick_results"
+save_intermediate_results: false  # Skip intermediate saves
+generate_plots: false             # Skip plots for speed
+
+# Performance settings
+computing:
+  n_jobs: 1
+  chunk_size: 50
+
+# Logging
+logging:
+  level: "INFO"
+
+# Seeds for reproducibility
+random_state: 42
+torch_seed: 42
+numpy_seed: 42
+
+# Validation settings
+validation:
+  cross_validation_folds: 2
+  test_split_ratio: 0.2
+
+# Advanced settings - all disabled for speed
+advanced:
+  enable_feature_selection: false
+  enable_hyperparameter_tuning: false
+  use_gpu: false
+
+# Monitoring
+monitoring:
+  enable_progress_tracking: true
+  log_frequency: 5

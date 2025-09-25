@@ -17,7 +17,10 @@ experiment:
 data:
   start_date: "2021-01-01"
   end_date: "2023-12-31"
-  # BigQuery settings inherited from bigquery_client.py
+  # BigQuery settings
+  bigquery:
+    project_id: "informationspillover"
+    dataset_id: "spillover_statistical_test"
   preprocessing:
     min_observations_per_subreddit: 100
     max_missing_ratio: 0.3

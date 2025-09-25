@@ -348,9 +348,9 @@ class BigQueryClient:
             symbol,
             DATE(snapped_at) as date,
             snapped_at,
-            price,
-            market_cap,
-            total_volume
+            price_usd as price,
+            market_cap_usd as market_cap,
+            volume_24h as total_volume
         FROM `{self.project_id}.{self.dataset_id}.crypto_prices`
         {where_clause}
         ORDER BY symbol, snapped_at
