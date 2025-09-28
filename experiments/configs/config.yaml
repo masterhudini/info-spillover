@@ -16,6 +16,10 @@ data:
   test_size: 0.2
   val_size: 0.25
   random_state: 42
+  # Hierarchical model parameters
+  sequence_length: 24
+  prediction_horizon: 1
+  scaling_method: "standard"
 
 # Model configuration
 model:
@@ -75,6 +79,57 @@ mlflow:
   experiment_name: "info_spillover_experiment"
   tracking_uri: "sqlite:///mlflow.db"
   artifact_location: "experiments/outputs/mlruns"
+
+# Hierarchical Models Configuration
+hierarchical_models:
+  subreddit_model_type: "lstm"  # Options: lstm, transformer
+  hidden_dim: 128
+  num_layers: 2
+  dropout: 0.2
+  attention: true
+  d_model: 128
+  nhead: 8
+  num_encoder_layers: 3
+  gnn_hidden_dim: 64
+  gnn_num_layers: 3
+  gnn_type: "GAT"  # Options: GAT, GCN, GGNN
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  batch_size: 32
+  training:
+    max_epochs: 50
+    patience: 10
+
+# Machine Learning Models Configuration
+ml_models:
+  random_forest:
+    n_estimators: 100
+    max_depth: 10
+    min_samples_split: 5
+    min_samples_leaf: 2
+    random_state: 42
+    n_jobs: -1
+  gradient_boosting:
+    n_estimators: 100
+    max_depth: 6
+    learning_rate: 0.1
+    random_state: 42
+  ridge:
+    alpha: 1.0
+    random_state: 42
+  svm:
+    C: 1.0
+    gamma: 'scale'
+    kernel: 'rbf'
+
+# Cross Validation Configuration
+cross_validation:
+  n_splits: 5
+  shuffle: false  # Use TimeSeriesSplit for temporal data
+
+# Reproducibility Configuration
+reproducibility:
+  set_seeds: true
 
 # Output paths
 outputs:

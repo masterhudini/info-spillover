@@ -65,6 +65,20 @@ class SubredditTimeSeriesDataset(Dataset):
             self.feature_columns = [col for col in candidate_columns
                                   if col in self.data.columns and
                                   self.data[col].dtype in ['int64', 'float64', 'int32', 'float32']]
+
+            # Fallback: if no features found with patterns, use all numeric columns except timestamp and identifier columns
+            if not self.feature_columns:
+                logger.warning(f"No features found with standard patterns for {subreddit}, using numeric columns as fallback")
+                exclude_cols = ['post_created_utc', 'created_utc', 'subreddit', 'id', 'post_id', 'comment_id']
+                self.feature_columns = [col for col in self.data.columns
+                                      if (self.data[col].dtype in ['int64', 'float64', 'int32', 'float32'] and
+                                          col not in exclude_cols)]
+
+            # Final validation: ensure we have at least one feature
+            if not self.feature_columns:
+                raise ValueError(f"No valid features found for subreddit {subreddit}. "
+                               f"Available columns: {list(self.data.columns)}")
+
         else:
             self.feature_columns = feature_columns
 
@@ -86,9 +100,28 @@ class SubredditTimeSeriesDataset(Dataset):
     def _prepare_sequences(self):
         """Prepare sliding window sequences"""
 
+        # Validate that we have features and targets
+        if not self.feature_columns:
+            raise ValueError(f"No feature columns available for {self.subreddit}")
+
+        if not self.target_columns:
+            logger.warning(f"No target columns found for {self.subreddit}, using compound_sentiment as fallback")
+            if 'compound_sentiment' in self.data.columns:
+                self.target_columns = ['compound_sentiment']
+            else:
+                # Create a simple target from first feature column
+                target_col = self.feature_columns[0]
+                self.data[f'next_{target_col}'] = self.data[target_col].shift(-1)
+                self.target_columns = [f'next_{target_col}']
+
         # Extract feature and target arrays - force numeric conversion
         features = self.data[self.feature_columns].apply(pd.to_numeric, errors='coerce').values
         targets = self.data[self.target_columns].apply(pd.to_numeric, errors='coerce').values
+
+        # Validate shapes
+        if features.shape[1] == 0:
+            raise ValueError(f"Feature matrix has 0 columns for {self.subreddit}. "
+                           f"Feature columns: {self.feature_columns}")
 
         # Handle missing values
         features = np.nan_to_num(features, nan=0.0)
@@ -97,21 +130,30 @@ class SubredditTimeSeriesDataset(Dataset):
         self.sequences = []
         self.targets = []
 
-        for i in range(len(features) - self.sequence_length - self.prediction_horizon + 1):
-            # Input sequence
-            seq = features[i:i + self.sequence_length]
+        # Ensure we have enough data for at least one sequence
+        min_required_length = self.sequence_length + self.prediction_horizon
+        if len(features) < min_required_length:
+            logger.warning(f"Insufficient data for {self.subreddit}: {len(features)} < {min_required_length}")
+            # Create minimal sequences with available data
+            self.sequences = np.array([features], dtype=np.float32)
+            self.targets = np.array([targets], dtype=np.float32)
+        else:
+            for i in range(len(features) - self.sequence_length - self.prediction_horizon + 1):
+                # Input sequence
+                seq = features[i:i + self.sequence_length]
 
-            # Target (next prediction_horizon steps)
-            target = targets[i + self.sequence_length:i + self.sequence_length + self.prediction_horizon]
+                # Target (next prediction_horizon steps)
+                target = targets[i + self.sequence_length:i + self.sequence_length + self.prediction_horizon]
 
-            self.sequences.append(seq)
-            self.targets.append(target)
+                self.sequences.append(seq)
+                self.targets.append(target)
 
-        self.sequences = np.array(self.sequences, dtype=np.float32)
-        self.targets = np.array(self.targets, dtype=np.float32)
+            self.sequences = np.array(self.sequences, dtype=np.float32)
+            self.targets = np.array(self.targets, dtype=np.float32)
 
         logger.info(f"Created {len(self.sequences)} sequences for {self.subreddit}")
         logger.info(f"Sequence shape: {self.sequences.shape}, Target shape: {self.targets.shape}")
+        logger.info(f"Feature columns ({len(self.feature_columns)}): {self.feature_columns[:5]}{'...' if len(self.feature_columns) > 5 else ''}")
 
     def __len__(self):
         return len(self.sequences)
@@ -126,16 +168,22 @@ class HierarchicalBatchSampler(Sampler):
     Samples from multiple subreddit datasets to create balanced batches
     """
 
-    def __init__(self, datasets: Dict[str, SubredditTimeSeriesDataset],
+    def __init__(self, dataset: 'HierarchicalDataset',
                  batch_size: int = 32, shuffle: bool = True):
-        self.datasets = datasets
-        self.subreddits = list(datasets.keys())
+        self.dataset = dataset
+        self.datasets = dataset.datasets
+        self.subreddits = list(self.datasets.keys())
         self.batch_size = batch_size
         self.shuffle = shuffle
 
         # Calculate total samples and samples per subreddit
-        self.total_samples = sum(len(ds) for ds in datasets.values())
-        self.samples_per_subreddit = {sr: len(ds) for sr, ds in datasets.items()}
+        self.total_samples = sum(len(ds) for ds in self.datasets.values())
+
+        # Create mapping from (subreddit, local_idx) to global_idx
+        self.global_index_map = {}
+        for global_idx, (subreddit, local_idx) in enumerate(dataset.index_map):
+            self.global_index_map[(subreddit, local_idx)] = global_idx
+        self.samples_per_subreddit = {sr: len(ds) for sr, ds in self.datasets.items()}
 
         # Calculate how many samples from each subreddit per batch
         self.samples_per_batch = max(1, batch_size // len(self.subreddits))
@@ -165,7 +213,9 @@ class HierarchicalBatchSampler(Sampler):
                                  len(subreddit_indices[subreddit]))
 
                     for i in range(positions[subreddit], end_pos):
-                        batch.append((subreddit, subreddit_indices[subreddit][i]))
+                        local_idx = subreddit_indices[subreddit][i]
+                        global_idx = self.global_index_map[(subreddit, local_idx)]
+                        batch.append(global_idx)
 
                     positions[subreddit] = end_pos
 
@@ -195,7 +245,8 @@ class HierarchicalDataset(Dataset):
 
     def __getitem__(self, idx):
         subreddit, dataset_idx = self.index_map[idx]
-        return subreddit, dataset_idx
+        data = self.datasets[subreddit][dataset_idx]
+        return (subreddit, data)
 
 
 class HierarchicalCollator:
@@ -209,6 +260,10 @@ class HierarchicalCollator:
         self.network = network
         self.subreddits = list(datasets.keys())
 
+        # Validate graph structure on initialization
+        if not self.validate_graph_structure():
+            logger.warning("Graph structure validation failed, graph operations may not work correctly")
+
     def __call__(self, batch_items):
         """
         Custom collate function for hierarchical batches
@@ -216,58 +271,210 @@ class HierarchicalCollator:
         subreddit_data = {}
         all_targets = []
 
-        # Group by subreddit
-        subreddit_batches = {}
-        for subreddit, idx in batch_items:
-            if subreddit not in subreddit_batches:
-                subreddit_batches[subreddit] = []
-            subreddit_batches[subreddit].append(idx)
+        # Group by subreddit and extract data
+        subreddit_sequences = {}
+        subreddit_targets = {}
 
-        # Extract actual data for each subreddit
-        for subreddit, indices in subreddit_batches.items():
-            if subreddit in self.datasets:
-                # Get data for this subreddit
-                sequences = []
-                targets = []
+        for subreddit, data_item in batch_items:
+            if subreddit not in subreddit_sequences:
+                subreddit_sequences[subreddit] = []
+                subreddit_targets[subreddit] = []
 
-                for idx in indices:
-                    seq, target = self.datasets[subreddit][idx]
-                    sequences.append(seq)
-                    targets.append(target)
+            # data_item is (sequence, target)
+            sequence, target = data_item
+            subreddit_sequences[subreddit].append(sequence)
+            subreddit_targets[subreddit].append(target)
 
-                if sequences:
-                    subreddit_data[subreddit] = torch.stack(sequences)
-                    all_targets.extend(targets)
+        # Stack sequences for each subreddit
+        for subreddit in subreddit_sequences:
+            if subreddit_sequences[subreddit]:
+                subreddit_data[subreddit] = torch.stack(subreddit_sequences[subreddit])
+                all_targets.extend(subreddit_targets[subreddit])
 
-        # Create graph data if network is available
-        graph_data = self._create_graph_data() if self.network else None
+        # Create graph data if network is available - pass available subreddits
+        available_subreddits = list(subreddit_data.keys()) if subreddit_data else None
+        graph_data = self._create_graph_data(available_subreddits) if self.network else None
 
-        # Stack all targets
+        # Concatenate all targets (handle variable lengths)
         if all_targets:
-            targets_tensor = torch.stack(all_targets)
+            # Flatten all targets to handle variable sequence lengths
+            flattened_targets = []
+            for target in all_targets:
+                if target.dim() > 1:
+                    # If target has multiple dimensions, flatten to 1D
+                    flattened_targets.append(target.view(-1))
+                else:
+                    flattened_targets.append(target)
+            targets_tensor = torch.cat(flattened_targets, dim=0)
         else:
             targets_tensor = torch.empty(0)
 
         return subreddit_data, graph_data, targets_tensor
 
-    def _create_graph_data(self):
-        """Create graph representation from network"""
+    def _create_graph_data(self, available_subreddits=None):
+        """Create graph representation from network with proper node indexing
+
+        Args:
+            available_subreddits: List of subreddits that have actual data/embeddings
+                                If None, uses all subreddits from datasets
+        """
         if not self.network:
             return None
 
-        # Simple adjacency matrix for now
-        num_nodes = len(self.subreddits)
-        adj_matrix = torch.zeros(num_nodes, num_nodes)
+        # Use available subreddits if provided, otherwise use all subreddits
+        if available_subreddits is None:
+            available_subreddits = self.subreddits
 
-        subreddit_to_idx = {sr: i for i, sr in enumerate(self.subreddits)}
+        # Filter to only include subreddits that exist in both datasets and network
+        network_nodes = set(self.network.nodes())
+        valid_subreddits = [sr for sr in available_subreddits if sr in network_nodes]
 
-        # Fill adjacency matrix based on network edges
+        if not valid_subreddits:
+            logger.warning("No valid subreddits found in both datasets and network, creating fallback graph")
+            return self.create_fallback_graph(available_subreddits if available_subreddits else [])
+
+        logger.info(f"Creating graph data for {len(valid_subreddits)} valid subreddits: {valid_subreddits}")
+
+        # Create a simple object to hold graph data
+        class GraphData:
+            def __init__(self):
+                pass
+
+        graph_data = GraphData()
+        graph_data.subreddit_names = valid_subreddits
+        graph_data.num_nodes = len(valid_subreddits)
+
+        # Create edge_index for PyTorch Geometric format with ONLY valid subreddits
+        edge_list = []
+        edge_weights = []
+        subreddit_to_idx = {sr: i for i, sr in enumerate(valid_subreddits)}
+
+        logger.info(f"Subreddit to index mapping: {subreddit_to_idx}")
+
         for u, v, data in self.network.edges(data=True):
+            # Only include edges where both nodes are in valid_subreddits
             if u in subreddit_to_idx and v in subreddit_to_idx:
                 i, j = subreddit_to_idx[u], subreddit_to_idx[v]
-                adj_matrix[i, j] = data.get('weight', 1.0)
+                edge_list.append([i, j])
 
-        return adj_matrix
+                # Handle complex edge data - extract scalar weight
+                weight = data.get('weight', 1.0)
+                if hasattr(weight, '__len__') and not isinstance(weight, str):
+                    # If weight is array-like, take the mean or first element
+                    if hasattr(weight, 'mean'):
+                        weight = float(weight.mean())
+                    else:
+                        weight = float(weight[0]) if len(weight) > 0 else 1.0
+                edge_weights.append(float(weight))
+
+        logger.info(f"Created {len(edge_list)} edges for graph")
+
+        # Validate edge indices
+        if edge_list:
+            max_index = max(max(edge) for edge in edge_list)
+            if max_index >= len(valid_subreddits):
+                raise ValueError(f"Edge index {max_index} >= num_nodes {len(valid_subreddits)}")
+
+            graph_data.edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+            graph_data.edge_attr = torch.tensor(edge_weights, dtype=torch.float)
+        else:
+            # No edges from network, try fallback graph if we have multiple nodes
+            if len(valid_subreddits) > 1:
+                logger.warning("No valid edges found in network graph, creating fallback connections")
+                fallback_graph = self.create_fallback_graph(valid_subreddits)
+                graph_data.edge_index = fallback_graph.edge_index
+                graph_data.edge_attr = fallback_graph.edge_attr
+            else:
+                # Single node or no nodes, create empty tensors
+                graph_data.edge_index = torch.empty((2, 0), dtype=torch.long)
+                graph_data.edge_attr = torch.empty(0, dtype=torch.float)
+                logger.warning("No valid edges found and insufficient nodes for fallback graph")
+
+        return graph_data
+
+    def _create_empty_graph_data(self):
+        """Create empty graph data structure"""
+        class GraphData:
+            def __init__(self):
+                pass
+
+        graph_data = GraphData()
+        graph_data.subreddit_names = []
+        graph_data.num_nodes = 0
+        graph_data.edge_index = torch.empty((2, 0), dtype=torch.long)
+        graph_data.edge_attr = torch.empty(0, dtype=torch.float)
+        return graph_data
+
+    def validate_graph_structure(self):
+        """Validate the graph structure against available datasets"""
+        if not self.network:
+            logger.info("No network provided, skipping graph validation")
+            return True
+
+        network_nodes = set(self.network.nodes())
+        dataset_subreddits = set(self.subreddits)
+
+        # Check for missing subreddits
+        missing_in_network = dataset_subreddits - network_nodes
+        missing_in_datasets = network_nodes - dataset_subreddits
+
+        if missing_in_network:
+            logger.warning(f"Subreddits in datasets but not in network: {missing_in_network}")
+
+        if missing_in_datasets:
+            logger.warning(f"Subreddits in network but not in datasets: {missing_in_datasets}")
+
+        # Check connectivity
+        valid_subreddits = dataset_subreddits & network_nodes
+        subgraph = self.network.subgraph(valid_subreddits)
+
+        if len(subgraph.nodes()) == 0:
+            logger.error("No valid subreddits found in both datasets and network")
+            return False
+
+        if len(subgraph.edges()) == 0:
+            logger.warning("No edges found between valid subreddits")
+
+        logger.info(f"Graph validation: {len(subgraph.nodes())} nodes, {len(subgraph.edges())} edges")
+        return True
+
+    def create_fallback_graph(self, available_subreddits):
+        """Create a minimal graph structure when network is unavailable or invalid
+
+        Args:
+            available_subreddits: List of subreddits that have data
+        """
+        if len(available_subreddits) <= 1:
+            return self._create_empty_graph_data()
+
+        logger.info(f"Creating fallback fully connected graph for {len(available_subreddits)} subreddits")
+
+        class GraphData:
+            def __init__(self):
+                pass
+
+        graph_data = GraphData()
+        graph_data.subreddit_names = available_subreddits
+        graph_data.num_nodes = len(available_subreddits)
+
+        # Create a fully connected graph with uniform weights
+        edge_list = []
+        edge_weights = []
+
+        for i in range(len(available_subreddits)):
+            for j in range(len(available_subreddits)):
+                if i != j:  # No self-loops
+                    edge_list.append([i, j])
+                    edge_weights.append(1.0)
+
+        if edge_list:
+            graph_data.edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+            graph_data.edge_attr = torch.tensor(edge_weights, dtype=torch.float)
+        else:
+            graph_data.edge_index = torch.empty((2, 0), dtype=torch.long)
+            graph_data.edge_attr = torch.empty(0, dtype=torch.float)
+
+        return graph_data
 
 
 class SubredditLSTM(nn.Module):
@@ -483,13 +690,36 @@ class SpilloverGNN(nn.Module):
 
     def forward(self, x, edge_index, edge_attr=None, batch=None):
         """
-        Forward pass
+        Forward pass with robust edge index validation
         Args:
             x: Node features (num_nodes, node_features)
             edge_index: Edge indices (2, num_edges)
             edge_attr: Edge attributes (num_edges, edge_features)
             batch: Batch assignment for batched processing
         """
+
+        # Validate inputs
+        if x.size(0) == 0:
+            logger.warning("Empty node features tensor, returning zeros")
+            return torch.zeros(0, self.hidden_dim, device=x.device)
+
+        # Validate edge indices are within bounds
+        if edge_index.numel() > 0:
+            max_edge_idx = edge_index.max().item()
+            if max_edge_idx >= x.size(0):
+                logger.error(f"Edge index {max_edge_idx} >= num_nodes {x.size(0)}")
+                # Create empty edge_index if all edges are invalid
+                edge_index = torch.empty((2, 0), dtype=torch.long, device=edge_index.device)
+                if edge_attr is not None:
+                    edge_attr = torch.empty(0, edge_attr.size(-1), device=edge_attr.device)
+
+            # Check for negative indices
+            if (edge_index < 0).any():
+                logger.warning("Found negative edge indices, filtering them out")
+                valid_mask = (edge_index >= 0).all(dim=0)
+                edge_index = edge_index[:, valid_mask]
+                if edge_attr is not None and edge_attr.numel() > 0:
+                    edge_attr = edge_attr[valid_mask]
 
         # Input projection
         h = self.input_projection(x)
@@ -504,7 +734,22 @@ class SpilloverGNN(nn.Module):
             h = self.gnn_layers[0](h, edge_index)
         else:
             for i, gnn_layer in enumerate(self.gnn_layers):
-                h_new = gnn_layer(h, edge_index, edge_attr=edge_attr)
+                # Check if the layer supports edge attributes
+                try:
+                    if edge_attr is not None and hasattr(self, 'edge_mlp'):
+                        h_new = gnn_layer(h, edge_index, edge_attr=edge_attr)
+                    else:
+                        h_new = gnn_layer(h, edge_index)
+                except (TypeError, RuntimeError, IndexError) as e:
+                    # Layer doesn't support edge_attr or has index issues, try without it
+                    logger.warning(f"GNN layer {i} failed with edge_attr, trying without: {e}")
+                    try:
+                        h_new = gnn_layer(h, edge_index)
+                    except (RuntimeError, IndexError) as e2:
+                        logger.error(f"GNN layer {i} failed completely: {e2}")
+                        # Skip this layer and continue with previous h
+                        continue
+
                 h_new = self.norm_layers[i](h_new)
                 h_new = F.relu(h_new)
                 h_new = self.dropout(h_new)
@@ -588,30 +833,73 @@ class HierarchicalSentimentModel(pl.LightningModule):
 
                 subreddit_embeddings[subreddit] = embedding
 
-        # Level 2: Graph neural network
-        if graph_data is not None:
-            # Stack node embeddings
-            node_embeddings = torch.stack([
-                subreddit_embeddings[subreddit]
-                for subreddit in graph_data.subreddit_names
+        # Level 2: Graph neural network with robust error handling
+        if graph_data is not None and graph_data.num_nodes > 0:
+            # Get subreddits that have both embeddings and are in graph
+            available_subreddits = [
+                subreddit for subreddit in graph_data.subreddit_names
                 if subreddit in subreddit_embeddings
-            ])
+            ]
 
-            # GNN forward pass
-            gnn_output = self.gnn_model(
-                node_embeddings,
-                graph_data.edge_index,
-                graph_data.edge_attr if hasattr(graph_data, 'edge_attr') else None
-            )
+            if len(available_subreddits) > 0:
+                logger.info(f"Processing GNN with {len(available_subreddits)} nodes: {available_subreddits}")
 
-            # Combine Level 1 and Level 2 predictions
-            combined_features = torch.cat([
-                torch.stack([subreddit_predictions[sr] for sr in subreddit_predictions]),
-                gnn_output
-            ], dim=-1)
+                # Stack node embeddings in the same order as graph_data.subreddit_names
+                node_embeddings = torch.stack([
+                    subreddit_embeddings[subreddit]
+                    for subreddit in available_subreddits
+                ])
 
-            final_predictions = self.fusion_layer(combined_features)
+                # Validate node embeddings shape
+                if node_embeddings.size(0) != len(available_subreddits):
+                    raise ValueError(f"Node embeddings size {node_embeddings.size(0)} != expected {len(available_subreddits)}")
+
+                # Validate edge indices are within bounds
+                if graph_data.edge_index.numel() > 0:
+                    max_edge_idx = graph_data.edge_index.max().item()
+                    if max_edge_idx >= node_embeddings.size(0):
+                        logger.warning(f"Edge index {max_edge_idx} >= num_nodes {node_embeddings.size(0)}, filtering edges")
+                        # Filter out invalid edges
+                        valid_edges_mask = (graph_data.edge_index < node_embeddings.size(0)).all(dim=0)
+                        graph_data.edge_index = graph_data.edge_index[:, valid_edges_mask]
+                        if hasattr(graph_data, 'edge_attr') and graph_data.edge_attr.numel() > 0:
+                            graph_data.edge_attr = graph_data.edge_attr[valid_edges_mask]
+                        logger.info(f"Filtered to {graph_data.edge_index.size(1)} valid edges")
+
+                try:
+                    # GNN forward pass
+                    gnn_output = self.gnn_model(
+                        node_embeddings,
+                        graph_data.edge_index,
+                        graph_data.edge_attr if hasattr(graph_data, 'edge_attr') else None
+                    )
+
+                    # Combine Level 1 and Level 2 predictions
+                    # Ensure compatible shapes for concatenation
+                    l1_preds = torch.stack([subreddit_predictions[sr] for sr in available_subreddits])
+
+                    if l1_preds.shape[0] == gnn_output.shape[0]:
+                        combined_features = torch.cat([l1_preds, gnn_output], dim=-1)
+                        final_predictions = self.fusion_layer(combined_features)
+                    else:
+                        logger.warning(f"Shape mismatch: L1 preds {l1_preds.shape}, GNN output {gnn_output.shape}")
+                        # Fallback to L1 only
+                        final_predictions = l1_preds
+
+                except Exception as e:
+                    logger.error(f"GNN forward pass failed: {e}")
+                    # Fallback to Level 1 predictions
+                    final_predictions = torch.stack([
+                        pred for pred in subreddit_predictions.values()
+                    ])
+            else:
+                logger.warning("No subreddits with embeddings found in graph, using L1 predictions only")
+                # Fallback: use only Level 1 predictions
+                final_predictions = torch.stack([
+                    pred for pred in subreddit_predictions.values()
+                ])
         else:
+            logger.info("No graph data available or empty graph, using L1 predictions only")
             # Fallback: use only Level 1 predictions
             final_predictions = torch.stack([
                 pred for pred in subreddit_predictions.values()
@@ -624,13 +912,29 @@ class HierarchicalSentimentModel(pl.LightningModule):
         subreddit_data, graph_data, targets = batch
         predictions = self(subreddit_data, graph_data)
 
-        # Multi-task loss
-        mse_loss = F.mse_loss(predictions[:, :2], targets[:, :2])  # Sentiment targets
-        if predictions.shape[-1] > 2 and targets.shape[-1] > 2:
-            ce_loss = F.cross_entropy(predictions[:, 2:], targets[:, 2:].long())  # Direction targets
-            total_loss = mse_loss + ce_loss
-        else:
+        # Multi-task loss - handle different tensor shapes
+        if targets.dim() == 1:
+            # Flatten predictions to match targets if needed
+            if predictions.dim() > 1:
+                predictions = predictions.view(-1)
+
+            # Handle size mismatch by taking minimum size
+            min_size = min(predictions.size(0), targets.size(0))
+            if predictions.size(0) != targets.size(0):
+                logger.warning(f"Size mismatch: predictions {predictions.size(0)} vs targets {targets.size(0)}, using first {min_size}")
+                predictions = predictions[:min_size]
+                targets = targets[:min_size]
+
+            mse_loss = F.mse_loss(predictions, targets)
             total_loss = mse_loss
+        else:
+            # 2D case
+            mse_loss = F.mse_loss(predictions[:, :2], targets[:, :2])  # Sentiment targets
+            if predictions.shape[-1] > 2 and targets.shape[-1] > 2:
+                ce_loss = F.cross_entropy(predictions[:, 2:], targets[:, 2:].long())  # Direction targets
+                total_loss = mse_loss + ce_loss
+            else:
+                total_loss = mse_loss
 
         # Log metrics
         self.log('train_loss', total_loss, on_step=True, on_epoch=True)
@@ -643,11 +947,29 @@ class HierarchicalSentimentModel(pl.LightningModule):
         subreddit_data, graph_data, targets = batch
         predictions = self(subreddit_data, graph_data)
 
-        # Multi-task loss
-        mse_loss = F.mse_loss(predictions[:, :2], targets[:, :2])
-        if predictions.shape[-1] > 2 and targets.shape[-1] > 2:
-            ce_loss = F.cross_entropy(predictions[:, 2:], targets[:, 2:].long())
-            total_loss = mse_loss + ce_loss
+        # Multi-task loss - handle different tensor shapes
+        if targets.dim() == 1:
+            # Flatten predictions to match targets if needed
+            if predictions.dim() > 1:
+                predictions = predictions.view(-1)
+
+            # Handle size mismatch by taking minimum size
+            min_size = min(predictions.size(0), targets.size(0))
+            if predictions.size(0) != targets.size(0):
+                logger.warning(f"Size mismatch: predictions {predictions.size(0)} vs targets {targets.size(0)}, using first {min_size}")
+                predictions = predictions[:min_size]
+                targets = targets[:min_size]
+
+            mse_loss = F.mse_loss(predictions, targets)
+            total_loss = mse_loss
+        else:
+            # 2D case
+            mse_loss = F.mse_loss(predictions[:, :2], targets[:, :2])
+            if predictions.shape[-1] > 2 and targets.shape[-1] > 2:
+                ce_loss = F.cross_entropy(predictions[:, 2:], targets[:, 2:].long())
+                total_loss = mse_loss + ce_loss
+            else:
+                total_loss = mse_loss
 
             # Accuracy for direction prediction
             direction_preds = torch.argmax(predictions[:, 2:], dim=-1)
@@ -656,8 +978,6 @@ class HierarchicalSentimentModel(pl.LightningModule):
                 direction_preds.cpu().numpy()
             )
             self.log('val_accuracy', accuracy, on_epoch=True)
-        else:
-            total_loss = mse_loss
 
         self.log('val_loss', total_loss, on_epoch=True)
         self.log('val_mse', mse_loss, on_epoch=True)
@@ -737,7 +1057,7 @@ class HierarchicalModelBuilder:
 
         gnn_model = SpilloverGNN(
             node_features=node_features,
-            edge_features=self.config.get('edge_features', 1),
+            edge_features=self.config.get('edge_features', 0),  # Disable edge features for now
             hidden_dim=self.config.get('gnn_hidden_dim', 64),
             num_layers=self.config.get('gnn_num_layers', 3),
             output_dim=self.config.get('gnn_output_dim', 4),
@@ -851,7 +1171,7 @@ class HierarchicalDataModule(pl.LightningDataModule):
 
         # Create custom batch sampler
         batch_sampler = HierarchicalBatchSampler(
-            datasets=self.train_datasets,
+            dataset=hierarchical_dataset,
             batch_size=self.config.get('batch_size', 32),
             shuffle=True
         )
@@ -880,7 +1200,7 @@ class HierarchicalDataModule(pl.LightningDataModule):
 
         # Create custom batch sampler
         batch_sampler = HierarchicalBatchSampler(
-            datasets=self.val_datasets,
+            dataset=hierarchical_dataset,
             batch_size=self.config.get('batch_size', 32),
             shuffle=False
         )
@@ -909,7 +1229,7 @@ class HierarchicalDataModule(pl.LightningDataModule):
 
         # Create custom batch sampler
         batch_sampler = HierarchicalBatchSampler(
-            datasets=self.test_datasets,
+            dataset=hierarchical_dataset,
             batch_size=self.config.get('batch_size', 32),
             shuffle=False
         )

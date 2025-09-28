@@ -190,18 +190,22 @@ class ComprehensiveTrainingPipeline:
         for date in dates:
             for subreddit in subreddits:
                 record = {
-                    'created_utc': date,
+                    'post_created_utc': date,  # Use consistent timestamp column name
                     'subreddit': subreddit,
                     'sentiment_positive': np.random.beta(2, 2),
                     'sentiment_negative': np.random.beta(2, 2),
                     'sentiment_neutral': np.random.beta(3, 2),
                     'sentiment_compound': np.random.normal(0, 0.3),
+                    'compound_sentiment': np.random.normal(0, 0.3),  # For consistency with processor
+                    'sentiment_score': np.random.beta(2, 2),         # Add score column
+                    'sentiment_label': np.random.choice(['positive', 'negative', 'neutral']),  # Add label column
                     'emotion_joy': np.random.beta(2, 3),
                     'emotion_fear': np.random.beta(2, 3),
                     'emotion_anger': np.random.beta(1.5, 3),
                     'count_posts': np.random.poisson(50),
                     'count_comments': np.random.poisson(200),
-                    'avg_score': np.random.normal(10, 5),
+                    'score': np.random.normal(10, 5),  # Rename for consistency
+                    'text': f"Sample {subreddit} post text",  # Add text column for feature extraction
                     'price_btc': 30000 + np.random.normal(0, 2000),
                     'volume_btc': np.random.exponential(1000000),
                     'market_cap': np.random.exponential(500000000)
@@ -209,7 +213,7 @@ class ComprehensiveTrainingPipeline:
                 data.append(record)
 
         synthetic_df = pd.DataFrame(data)
-        synthetic_df['created_utc'] = pd.to_datetime(synthetic_df['created_utc'])
+        synthetic_df['post_created_utc'] = pd.to_datetime(synthetic_df['post_created_utc'])
 
         logger.info(f"🧪 Generated {len(synthetic_df)} synthetic records")
         return synthetic_df
@@ -220,21 +224,53 @@ class ComprehensiveTrainingPipeline:
         logger.info("⚙️ Processing data and engineering features...")
 
         # Initialize hierarchical data processor
-        processor_config = {
-            'sequence_length': self.config['data']['sequence_length'],
-            'prediction_horizon': self.config['data']['prediction_horizon'],
-            'scaling_method': self.config['data']['scaling_method'],
-            'subreddits': self.raw_data['subreddit'].unique().tolist()
-        }
+        self.data_processor = HierarchicalDataProcessor()
 
-        self.data_processor = HierarchicalDataProcessor(processor_config)
+        # Process the data using the correct method
+        start_date = self.config.get('data', {}).get('start_date')
+        end_date = self.config.get('data', {}).get('end_date')
 
-        # Process the data
-        processed_results = self.data_processor.process_hierarchical_data(self.raw_data)
+        # If we have raw_data from synthetic generation, process it directly
+        if hasattr(self, 'raw_data') and self.raw_data is not None:
+            logger.info("Processing existing raw data...")
 
-        self.processed_data = processed_results['hierarchical_features']
-        self.features_df = processed_results['ml_features']
-        self.network = processed_results['network']
+            # Process hierarchical features
+            self.processed_data = self.data_processor.process_hierarchical_features(self.raw_data)
+
+            # Build network features
+            self.processed_data, self.network = self.data_processor.build_network_features(self.processed_data)
+
+            # Create targets
+            self.processed_data = self.data_processor.create_targets(self.processed_data)
+
+            # Create ML features dataframe (for traditional ML models)
+            feature_columns = [col for col in self.processed_data.columns
+                             if any(pattern in col for pattern in
+                             ['sentiment_', 'emotion_', 'ratio_', 'count_', 'net_spillover', 'pagerank'])]
+
+            if feature_columns:
+                self.features_df = self.processed_data[feature_columns + ['subreddit']].copy()
+            else:
+                # Fallback: create basic features from available columns
+                numeric_cols = self.processed_data.select_dtypes(include=[np.number]).columns
+                self.features_df = self.processed_data[numeric_cols].copy()
+        else:
+            # Process from BigQuery data
+            self.processed_data, self.network, _ = self.data_processor.process_full_pipeline(
+                start_date, end_date
+            )
+
+            # Create ML features dataframe
+            feature_columns = [col for col in self.processed_data.columns
+                             if any(pattern in col for pattern in
+                             ['sentiment_', 'emotion_', 'ratio_', 'count_', 'net_spillover', 'pagerank'])]
+
+            if feature_columns:
+                self.features_df = self.processed_data[feature_columns + ['subreddit']].copy()
+            else:
+                # Fallback: create basic features from available columns
+                numeric_cols = self.processed_data.select_dtypes(include=[np.number]).columns
+                self.features_df = self.processed_data[numeric_cols].copy()
 
         logger.info(f"✅ Processed data shapes:")
         logger.info(f"   Hierarchical: {self.processed_data.shape}")

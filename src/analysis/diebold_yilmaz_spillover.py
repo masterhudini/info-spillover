@@ -281,23 +281,35 @@ class DieboldYilmazSpillover:
         logger.info("Performing VAR model diagnostics...")
 
         try:
-            # Test for serial correlation (Portmanteau test)
-            portmanteau = var_fitted.test_serial_correlation(lags=10)
+            # Stability test (eigenvalues) - always available
+            try:
+                eigenvalues = var_fitted.roots
+                is_stable = all(abs(root) < 1.0 for root in eigenvalues)
+                logger.info(f"VAR Model stability: {'Stable' if is_stable else 'Unstable'}")
+                if not is_stable:
+                    logger.warning("VAR model may be unstable - interpret spillover results with caution")
+            except:
+                logger.info("VAR stability check not available")
 
-            # Test for normality
-            normality = var_fitted.test_normality()
+            # Test for serial correlation (if available)
+            try:
+                # Try different methods for serial correlation test
+                if hasattr(var_fitted, 'test_serial_correlation'):
+                    portmanteau = var_fitted.test_serial_correlation(lags=10)
+                    logger.info(f"  Serial correlation p-value: {portmanteau.pvalue:.4f}")
+                elif hasattr(var_fitted, 'test_portmanteau'):
+                    portmanteau = var_fitted.test_portmanteau(lags=10)
+                    logger.info(f"  Portmanteau test p-value: {portmanteau.pvalue:.4f}")
+            except:
+                logger.info("  Serial correlation test not available")
 
-            # Stability test (eigenvalues)
-            eigenvalues = var_fitted.roots
-            is_stable = all(abs(root) < 1.0 for root in eigenvalues)
-
-            logger.info(f"VAR Diagnostics:")
-            logger.info(f"  Serial correlation p-value: {portmanteau.pvalue:.4f}")
-            logger.info(f"  Normality p-value: {normality.pvalue:.4f}")
-            logger.info(f"  Model stability: {'Stable' if is_stable else 'Unstable'}")
-
-            if not is_stable:
-                logger.warning("VAR model may be unstable - interpret spillover results with caution")
+            # Test for normality (if available)
+            try:
+                if hasattr(var_fitted, 'test_normality'):
+                    normality = var_fitted.test_normality()
+                    logger.info(f"  Normality p-value: {normality.pvalue:.4f}")
+            except:
+                logger.info("  Normality test not available")
 
         except Exception as e:
             logger.warning(f"VAR diagnostics failed: {str(e)}")
@@ -504,7 +516,16 @@ class DieboldYilmazSpillover:
         pairwise = spillover_measures['pairwise_spillovers']
 
         # Only add edges for significant spillovers (above threshold)
-        threshold = np.std(list(pairwise.values())) * 1.5  # 1.5 standard deviations
+        # Handle different pairwise formats
+        if isinstance(pairwise, pd.DataFrame):
+            # DataFrame format: extract values properly
+            threshold = np.std(pairwise.values.flatten()) * 1.5  # 1.5 standard deviations
+        elif isinstance(pairwise, dict):
+            # Dictionary format: extract values from dict
+            threshold = np.std(list(pairwise.values())) * 1.5
+        else:
+            # Numpy array format: use values directly
+            threshold = np.std(pairwise.flatten()) * 1.5
 
         for i, source in enumerate(variable_names):
             for j, target in enumerate(variable_names):
@@ -512,9 +533,16 @@ class DieboldYilmazSpillover:
                     if isinstance(pairwise, dict):
                         # Handle dictionary format
                         spillover = pairwise.get((source, target), pairwise.get((i, j), 0.0))
+                    elif isinstance(pairwise, pd.DataFrame):
+                        # Handle DataFrame format - use proper indexing
+                        try:
+                            spillover = pairwise.loc[source, target]
+                        except (KeyError, IndexError):
+                            spillover = pairwise.iloc[i, j] if i < pairwise.shape[0] and j < pairwise.shape[1] else 0.0
                     else:
-                        # Handle DataFrame format
-                        spillover = pairwise.iloc[i, j]
+                        # Handle numpy array format
+                        spillover = pairwise[i, j] if i < pairwise.shape[0] and j < pairwise.shape[1] else 0.0
+
                     if abs(spillover) > threshold:
                         G.add_edge(source, target,
                                  weight=abs(spillover),
