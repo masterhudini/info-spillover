@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets
+.env
+*.key
+credentials*.json
+
+# Data
+data/processed/*.csv
+data/raw/
+
+# Logs
+*.log
+nohup.out
+
+# Results (keep structure, ignore content)
+results/*.txt
+results/*.json
+
+# Reports (keep structure)
+reports/*.txt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

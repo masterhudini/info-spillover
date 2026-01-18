@@ -1,0 +1,6 @@
+model:
+  hidden_dim: 64
+  gnn_dim: 64
+  epochs: 20
+  lr: 0.001
+  batch_size: 32

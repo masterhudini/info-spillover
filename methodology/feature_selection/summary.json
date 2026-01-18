@@ -1,0 +1,14 @@
+{
+  "rows": 16675,
+  "subreddits": 10,
+  "window_bins": 12,
+  "lag_list": [
+    1,
+    2,
+    3
+  ],
+  "features_total": 69,
+  "features_pass_rate": 12,
+  "pass_rate_threshold": 0.8,
+  "corr_threshold": 0.95
+}

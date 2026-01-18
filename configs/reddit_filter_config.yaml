@@ -1,0 +1,87 @@
+# Reddit Semantic Filter Configuration
+# Two-stage hybrid: Keyword filter → Embedding filter
+
+# Stage 1: Keyword Pre-Filter
+stage1_keyword_filter:
+  # Minimum crypto keywords to pass Stage 1
+  min_crypto_keywords: 1
+
+  # Keyword dictionary path
+  keyword_dict_path: "data/crypto_keywords.json"
+
+  # Case sensitive matching
+  case_sensitive: false
+
+  # Special handling for short comments
+  allow_short_confident: true  # Pass short (<50 tokens) if has ticker or strong slang
+
+# Stage 2: Embedding Semantic Filter
+stage2_embedding_filter:
+  # SentenceTransformer model
+  model_name: "all-MiniLM-L6-v2"  # 384 dims, fast, good quality
+
+  # Similarity thresholds (cosine similarity to reference corpus)
+  similarity_threshold_posts: 0.55     # Lowered for better post retention
+  similarity_threshold_comments: 0.5   # Lower for comments (shorter text)
+
+  # Batch processing
+  batch_size: 1000  # Encode 1000 texts at once
+
+  # Reference corpus
+  reference_corpus_path: "data/reference_corpus_candidates_500.txt"
+
+  # Save embeddings for debugging
+  save_embeddings: false
+
+# Processing settings
+processing:
+  # Input/output paths
+  input_dir: "/home/Hudini/gcs/own_scrapped"
+  output_dir: "data/reddit_filtered"
+  intermediate_dir: "data/reddit_stage1"  # After Stage 1
+
+  # Parallel processing
+  num_workers: 4
+
+  # Save intermediate results
+  save_stage1_output: true  # For debugging/analysis
+
+  # Attach quality scores to output
+  attach_metadata: true
+
+# Output settings
+output:
+  # Output format
+  format: "json"  # Keep original JSON structure
+
+  # Add quality score fields
+  add_quality_score: true
+  add_filter_stage: true
+  add_semantic_category: false  # Optional: categorize by topic
+
+  # BigQuery upload
+  upload_to_bigquery: true
+  bigquery_project: "your-project-id"  # Update with actual project
+  bigquery_dataset: "info_spillover"
+  bigquery_table: "reddit_filtered"
+
+  # Generate reports
+  generate_statistics: true
+  statistics_file: "data/reddit_filtered/filtering_report.json"
+
+# Validation settings
+validation:
+  # Sample size for manual validation
+  validation_sample_size: 250
+
+  # Stratified sampling (proportional by subreddit)
+  stratified_sampling: true
+
+  # Output validation samples
+  validation_output: "data/reddit_filtered/validation_samples.json"
+
+# Logging
+logging:
+  level: "INFO"
+  file: "logs/reddit_filtering.log"
+  console: true

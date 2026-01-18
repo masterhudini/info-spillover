@@ -1,0 +1,6 @@
+optuna_search_space:
+  hidden_dim: [32, 64]
+  gnn_dim: [32, 64]
+  epochs: [15, 25, 35]
+  lr: [0.0003, 0.0005, 0.001]
+  batch_size: [16]
