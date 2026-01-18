@@ -19,20 +19,22 @@ ENV/
 *.key
 credentials*.json
 
-# Data
-data/processed/*.csv
+# Data - CSV files
+*.csv
+data/processed/
 data/raw/
 
 # Logs
 *.log
 nohup.out
 
-# Results (keep structure, ignore content)
+# Results and reports
 results/*.txt
 results/*.json
+reports/
 
-# Reports (keep structure)
-reports/*.txt
+# Markdown docs
+*.md
 
 # Jupyter
 .ipynb_checkpoints/
@@ -40,3 +42,8 @@ reports/*.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# Text reports
+context/
+docs/
+methodology/
